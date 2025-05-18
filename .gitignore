@@ -1,0 +1,58 @@
+# Configuration files
+app_settings.json
+
+# Profile data
+profiles/
+
+# History data
+history/
+
+.tmp.driveupload/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.nox/
+.eggs/
+*.egg-info/
+*.egg
+
+# IDE/Editor specific files
+.vscode/
+.idea/
+.vs/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Build and distribution
+build/
+dist/
+*.zip
+*.tar.gz
+*.tgz
+*.rar
+
+# Log files
+*.log
+logs/
+
+# Coverage reports
+.coverage
+coverage.xml
+htmlcov/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/ 

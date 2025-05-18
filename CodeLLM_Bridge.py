@@ -1,0 +1,1983 @@
+import os
+import json
+import time
+import fnmatch
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+import datetime
+import shutil
+
+CONFIG_FILE = "app_settings.json"
+PROFILES_DIR = "profiles"
+HISTORY_DIR = "history"  # New directory for history
+
+# Theme colors
+LIGHT_THEME = {
+    "bg": "#f0f0f0",
+    "fg": "#000000",
+    "button_bg": "#e0e0e0",
+    "button_fg": "#000000",
+    "text_bg": "#ffffff",
+    "text_fg": "#000000",
+    "listbox_bg": "#ffffff",
+    "listbox_fg": "#000000",
+    "tree_bg": "#ffffff",
+    "tree_fg": "#000000",
+    "frame_bg": "#f0f0f0",
+    "status_bg": "#f0f0f0",
+    "status_fg": "#333333",
+    "highlight_bg": "#0078d7",
+    "highlight_fg": "#ffffff"
+}
+
+DARK_THEME = {
+    "bg": "#1e1e1e",
+    "fg": "#ffffff",
+    "button_bg": "#333333",
+    "button_fg": "#ffffff",
+    "text_bg": "#121212",
+    "text_fg": "#e0e0e0",
+    "listbox_bg": "#121212",
+    "listbox_fg": "#e0e0e0",
+    "tree_bg": "#121212",
+    "tree_fg": "#e0e0e0",
+    "frame_bg": "#1e1e1e",
+    "status_bg": "#007acc",
+    "status_fg": "#ffffff",
+    "highlight_bg": "#0078d7",
+    "highlight_fg": "#ffffff",
+    "content_bg": "#080808",  # Even darker for content areas
+    "content_fg": "#e0e0e0"   # Bright text for contrast
+}
+
+def read_file_with_fallback(path):
+    """
+    Try reading a file with UTF-8, then fallback to CP-1252,
+    and finally CP-1252 with errors='replace' if needed.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        try:
+            with open(path, 'r', encoding='cp1252') as f:
+                return f.read()
+        except UnicodeDecodeError:
+            with open(path, 'r', encoding='cp1252', errors='replace') as f:
+                return f.read()
+
+class FolderMonitorApp:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("CodeLLM Bridge by Psynect Corp - psynect.ai")
+
+        # Create profiles directory if it doesn't exist
+        if not os.path.exists(PROFILES_DIR):
+            os.makedirs(PROFILES_DIR)
+            
+        # Create history directory if it doesn't exist
+        if not os.path.exists(HISTORY_DIR):
+            os.makedirs(HISTORY_DIR)
+
+        # Theme setting
+        self.dark_mode = tk.BooleanVar(value=False)
+        self.current_theme = LIGHT_THEME
+
+        # Profile management
+        self.current_profile = "default"
+        self.profiles = self.get_available_profiles()
+        
+        # History management
+        self.history_items = []  # List to store history items
+        self.selected_history_item = None  # Currently selected history item
+        
+        # Status message (replaces message boxes)
+        self.status_message = ""
+        self.status_timer = None
+
+        # We store multiple top-level folders
+        self.root_folders = []
+
+        # folder_tree_data: path -> {'checked': bool, 'is_dir': bool}
+        self.folder_tree_data = {}
+        # path -> tree item ID
+        self.tree_ids_map = {}
+
+        self.poll_interval_ms = 3000
+
+        # Meta prompts
+        self.meta_prompts = []
+        self.user_instructions = ""
+
+        # Default ignore patterns for common system folders
+        self.default_ignore_patterns = [
+            "*/.git/*",
+            "*/.venv/*", 
+            "*/__pycache__/*",
+            "*/.vs/*",
+            "*/.vscode/*",
+            "*/.idea/*",
+            "*/node_modules/*",
+            "*/build/*",
+            "*/dist/*",
+            "*/.svn/*",
+            "*/.DS_Store"
+        ]
+        
+        # Ignore patterns
+        self.ignore_patterns = []
+        
+        # Default ignore patterns for initial setup (will be populated on first launch)
+        self.default_initial_ignore_patterns = [
+            "**/node_modules/",
+            "**/.npm/",
+            "**/__pycache__/",
+            "**/.pytest_cache/",
+            "**/.mypy_cache/",
+            "# Build caches",
+            "**/.gradle/",
+            "**/.nuget/",
+            "**/.cargo/",
+            "**/.stack-work/",
+            "**/.ccache/",
+            "# IDE and Editor caches",
+            "**/.idea/",
+            "**/.vscode/",
+            "**/*.swp",
+            "**/*~",
+            "# Temp files",
+            "**/*.tmp",
+            "**/*.temp",
+            "**/*.bak",
+            "**/*.meta",
+            "**/package-lock.json",
+            "# Media files",
+            "**/*.jpg",
+            "**/*.jpeg",
+            "**/*.png",
+            "**/*.gif",
+            "**/*.bmp",
+            "**/*.ico",
+            "**/*.svg",
+            "**/*.webp",
+            "**/*.mp4",
+            "**/*.avi",
+            "**/*.mov",
+            "**/*.wmv",
+            "**/*.flv",
+            "**/*.mkv",
+            "**/*.webm",
+            "**/*.mp3",
+            "**/*.wav",
+            "**/*.ogg",
+            "**/*.m4a",
+            "**/*.flac",
+            "# Certificate files",
+            "**/*.pem",
+            "**/*.crt",
+            "**/*.cer",
+            "**/*.key",
+            "**/*.pfx",
+            "**/*.p12",
+            "**/*.csr"
+        ]
+        
+        # Flag to control whether to filter system folders
+        self.filter_system_folders = tk.BooleanVar(value=True)
+
+        # We keep the saved check states from config
+        self.saved_folder_checks = {}
+
+        # Checkbox for copying entire file tree
+        self.copy_entire_tree_var = tk.BooleanVar(value=False)
+
+        # Instructions expanded state
+        self.instructions_expanded = tk.BooleanVar(value=False)
+
+        # A set of directories we've already visited to avoid re-adding them
+        self.visited_dirs = set()
+
+        # First create widgets
+        self.create_widgets()
+        
+        # Then load settings and build tree
+        self.load_settings()
+        self.refresh_prompts_listbox()
+        
+        # Update current theme based on settings
+        if self.dark_mode.get():
+            self.current_theme = DARK_THEME
+        else:
+            self.current_theme = LIGHT_THEME
+            
+        # Apply theme
+        self.apply_theme()
+        
+        # Set some defaults for text widgets (will be overridden if needed)
+        text_bg = self.current_theme["text_bg"]
+        text_fg = self.current_theme["text_fg"]
+        self.master.option_add("*Text.Background", text_bg)
+        self.master.option_add("*Text.Foreground", text_fg)
+        
+        # Start polling
+        self.schedule_folder_poll()
+
+    # -----------------------------------------------------------------------
+    #  GUI
+    # -----------------------------------------------------------------------
+    def create_widgets(self):
+        # Main container
+        main_container = tk.Frame(self.master)
+        main_container.pack(fill=tk.BOTH, expand=True)
+        
+        # Profile Management Frame
+        profile_frame = tk.Frame(main_container)
+        profile_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        tk.Label(profile_frame, text="Profile:").pack(side=tk.LEFT, padx=5)
+        self.profile_var = tk.StringVar(value=self.current_profile)
+        self.profile_combo = ttk.Combobox(profile_frame, textvariable=self.profile_var, values=self.profiles)
+        self.profile_combo.pack(side=tk.LEFT, padx=5)
+        self.profile_combo.bind('<<ComboboxSelected>>', self.on_profile_selected)
+
+        btn_new_profile = tk.Button(profile_frame, text="New Profile", command=self.on_new_profile)
+        btn_new_profile.pack(side=tk.LEFT, padx=5)
+
+        btn_update_profile = tk.Button(profile_frame, text="Update Profile", command=self.on_update_profile)
+        btn_update_profile.pack(side=tk.LEFT, padx=5)
+
+        btn_delete_profile = tk.Button(profile_frame, text="Delete Profile", command=self.on_delete_profile)
+        btn_delete_profile.pack(side=tk.LEFT, padx=5)
+        
+        # Dark mode toggle
+        self.dark_mode_check = tk.Checkbutton(profile_frame, text="Dark Mode", 
+                                             variable=self.dark_mode, 
+                                             command=self.on_dark_mode_toggle)
+        self.dark_mode_check.pack(side=tk.RIGHT, padx=5)
+
+        # Refresh Button Frame
+        refresh_frame = tk.Frame(main_container)
+        refresh_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        btn_refresh = tk.Button(refresh_frame, text="Refresh Folders", command=self.on_refresh_folders)
+        btn_refresh.pack(side=tk.LEFT, padx=5)
+
+        # System Folder Filter Checkbox
+        chk_system_filter = tk.Checkbutton(
+            refresh_frame, 
+            text="Hide system folders (.git, .venv, etc.)",
+            variable=self.filter_system_folders,
+            command=self.on_toggle_system_filter
+        )
+        chk_system_filter.pack(side=tk.LEFT, padx=5)
+
+        top_frame = tk.Frame(main_container)
+        top_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        # Add Folder
+        btn_add_folder = tk.Button(top_frame, text="Add Folder", command=self.on_add_folder)
+        btn_add_folder.pack(side=tk.LEFT, padx=5)
+
+        # Remove Folder
+        btn_remove_folder = tk.Button(top_frame, text="Remove Folder", command=self.on_remove_folder)
+        btn_remove_folder.pack(side=tk.LEFT, padx=5)
+
+        # Checkbox: copy entire file tree
+        chk_full_tree = tk.Checkbutton(
+            top_frame,
+            text="Copy entire file tree (ignore checks)",
+            variable=self.copy_entire_tree_var
+        )
+        chk_full_tree.pack(side=tk.LEFT, padx=5)
+
+        # Add Meta Prompt
+        btn_add_prompt = tk.Button(top_frame, text="Add New Meta Prompt", command=self.on_add_prompt)
+        btn_add_prompt.pack(side=tk.LEFT, padx=5)
+
+        # Copy
+        btn_copy = tk.Button(top_frame, text="Copy to Clipboard", command=self.on_copy_to_clipboard)
+        btn_copy.pack(side=tk.RIGHT, padx=5)
+
+        # MAIN area
+        main_frame = tk.Frame(main_container)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Left side: Tree and History
+        left_side_frame = tk.Frame(main_frame)
+        left_side_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Tree area
+        tree_frame = tk.LabelFrame(left_side_frame, text="Folder Tree")
+        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.tree = ttk.Treeview(tree_frame, columns=["Name"], show='tree')
+        self.tree.pack(fill=tk.BOTH, expand=True)
+        self.tree.bind("<Double-1>", self.on_tree_item_double_click)
+
+        # History section
+        history_frame = tk.LabelFrame(left_side_frame, text="Copy History")
+        history_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=False, padx=5, pady=5)
+
+        # Split the history frame into list and viewer
+        history_split_frame = tk.PanedWindow(history_frame, orient=tk.HORIZONTAL)
+        history_split_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # History list panel
+        history_list_panel = tk.Frame(history_split_frame)
+        history_split_frame.add(history_list_panel, width=200)
+        
+        # History list with scrollbar
+        history_list_frame = tk.Frame(history_list_panel)
+        history_list_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.history_listbox = tk.Listbox(history_list_frame, height=6)
+        self.history_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.history_listbox.bind('<<ListboxSelect>>', self.on_history_item_selected)
+
+        # Scrollbar for history list
+        history_scrollbar = ttk.Scrollbar(history_list_frame, orient="vertical", command=self.history_listbox.yview)
+        history_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.history_listbox.configure(yscrollcommand=history_scrollbar.set)
+
+        # History buttons
+        history_btn_frame = tk.Frame(history_list_panel)
+        history_btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        btn_copy_history_content = tk.Button(history_btn_frame, text="Copy Content", command=self.on_copy_history_content)
+        btn_copy_history_content.pack(side=tk.LEFT, padx=5, pady=2)
+
+        btn_copy_history_prompt = tk.Button(history_btn_frame, text="Copy Prompt", command=self.on_copy_history_prompt)
+        btn_copy_history_prompt.pack(side=tk.LEFT, padx=5, pady=2)
+
+        btn_delete_history = tk.Button(history_btn_frame, text="Delete Item", command=self.on_delete_history_item)
+        btn_delete_history.pack(side=tk.RIGHT, padx=5, pady=2)
+        
+        # History content viewer panel
+        history_viewer_panel = tk.Frame(history_split_frame)
+        history_split_frame.add(history_viewer_panel, width=400)
+        
+        # Add notebook for content and instructions - use our custom method
+        self.create_history_content_tabs(history_viewer_panel)
+        
+        # Right side: prompts, instructions, filters
+        right_frame = tk.Frame(main_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # Meta prompts
+        prompts_frame = tk.LabelFrame(right_frame, text="Meta Prompts")
+        prompts_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=5, pady=5)
+
+        self.prompts_listbox = tk.Listbox(prompts_frame, height=8, selectmode=tk.SINGLE)
+        self.prompts_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        prompt_btn_frame = tk.Frame(prompts_frame)
+        prompt_btn_frame.pack(side=tk.LEFT, fill=tk.Y)
+
+        btn_toggle_prompt = tk.Button(prompt_btn_frame, text="Toggle Selected", command=self.on_toggle_prompt)
+        btn_toggle_prompt.pack(fill=tk.X, pady=2)
+
+        btn_edit_prompt = tk.Button(prompt_btn_frame, text="Edit Prompt", command=self.on_edit_prompt)
+        btn_edit_prompt.pack(fill=tk.X, pady=2)
+
+        btn_remove_prompt = tk.Button(prompt_btn_frame, text="Remove Prompt", command=self.on_remove_prompt)
+        btn_remove_prompt.pack(fill=tk.X, pady=2)
+
+        # User Instructions
+        instr_frame = tk.LabelFrame(right_frame, text="User Instructions (always copied)")
+        instr_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=5, pady=5)
+
+        instr_controls = tk.Frame(instr_frame)
+        instr_controls.pack(fill=tk.X)
+
+        # Add undo/redo buttons to instructions
+        undo_btn = tk.Button(instr_controls, text="Undo", command=lambda: self.do_undo(self.instructions_text))
+        undo_btn.pack(side=tk.LEFT, padx=2, pady=2)
+        
+        redo_btn = tk.Button(instr_controls, text="Redo", command=lambda: self.do_redo(self.instructions_text))
+        redo_btn.pack(side=tk.LEFT, padx=2, pady=2)
+
+        self.expand_btn = tk.Button(instr_controls, text="Expand", command=self.toggle_instructions_size)
+        self.expand_btn.pack(side=tk.RIGHT, padx=5, pady=2)
+
+        self.instructions_text = ScrolledText(instr_frame, height=4, undo=True, maxundo=-1)  # Unlimited undo
+        self.instructions_text.pack(fill=tk.BOTH, expand=True)
+        if self.user_instructions:
+            self.instructions_text.insert("1.0", self.user_instructions)
+        self.instructions_text.bind("<<Modified>>", self.on_instructions_modified)
+        
+        # Bind keyboard shortcuts
+        self.instructions_text.bind("<Control-z>", lambda e: self.handle_undo(e, self.instructions_text))
+        self.instructions_text.bind("<Control-y>", lambda e: self.handle_redo(e, self.instructions_text))
+
+        # Filters
+        filters_frame = tk.LabelFrame(right_frame, text="Ignore Patterns")
+        filters_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Add filter controls frame
+        filter_controls = tk.Frame(filters_frame)
+        filter_controls.pack(fill=tk.X)
+        
+        # Add undo/redo buttons to filters
+        undo_filter_btn = tk.Button(filter_controls, text="Undo", command=lambda: self.do_undo(self.filters_text))
+        undo_filter_btn.pack(side=tk.LEFT, padx=2, pady=2)
+        
+        redo_filter_btn = tk.Button(filter_controls, text="Redo", command=lambda: self.do_redo(self.filters_text))
+        redo_filter_btn.pack(side=tk.LEFT, padx=2, pady=2)
+
+        self.filters_text = ScrolledText(filters_frame, height=6, undo=True, maxundo=-1)  # Unlimited undo
+        self.filters_text.pack(fill=tk.BOTH, expand=True)
+        if self.ignore_patterns:
+            filters_content = "\n".join(self.ignore_patterns)
+            self.filters_text.insert("1.0", filters_content)
+            
+        # Bind keyboard shortcuts for filters text
+        self.filters_text.bind("<Control-z>", lambda e: self.handle_undo(e, self.filters_text))
+        self.filters_text.bind("<Control-y>", lambda e: self.handle_redo(e, self.filters_text))
+
+        btn_save_filters = tk.Button(filters_frame, text="Save Filters", command=self.on_save_filters)
+        btn_save_filters.pack(side=tk.BOTTOM, anchor=tk.E, padx=5, pady=5)
+        
+        # Enhanced status bar at the bottom of the window
+        status_frame = tk.Frame(main_container, height=30)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        self.status_bar = tk.Label(status_frame, text="Status messages will appear here", 
+                               bd=1, relief=tk.SUNKEN, anchor=tk.W,
+                               font=('Arial', 10, 'bold'),
+                               bg='#f0f0f0', fg='#333333',
+                               height=2)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+        
+    def on_dark_mode_toggle(self):
+        """Handle dark mode toggle from checkbox"""
+        # Get the latest value
+        is_dark = self.dark_mode.get()
+        # Update the theme
+        self.current_theme = DARK_THEME if is_dark else LIGHT_THEME
+        
+        # Apply new colors to content viewers
+        self.update_content_viewer_colors()
+        
+        # Apply theme to all widgets
+        self.apply_theme()
+        self.save_settings()
+        theme_name = "dark" if is_dark else "light"
+        self.set_status(f"Switched to {theme_name} mode")
+        
+        # Force a complete refresh of the main window
+        self.master.update_idletasks()
+        self.master.update()
+
+    def toggle_theme(self):
+        """Toggle between light and dark themes programmatically"""
+        # Explicitly toggle the variable
+        new_value = not self.dark_mode.get()
+        self.dark_mode.set(new_value)
+        
+        # Call the same handler the checkbox uses
+        self.on_dark_mode_toggle()
+
+    def update_content_viewer_colors(self):
+        """Update text colors for content viewers based on current theme"""
+        content_bg = self.current_theme.get("content_bg", self.current_theme["text_bg"])
+        content_fg = self.current_theme.get("content_fg", self.current_theme["text_fg"])
+        
+        if hasattr(self, 'content_viewer'):
+            self.content_viewer.config(
+                bg=content_bg,
+                fg=content_fg,
+                insertbackground=self.current_theme["fg"],
+                selectbackground=self.current_theme["highlight_bg"],
+                selectforeground=self.current_theme["highlight_fg"]
+            )
+            
+        if hasattr(self, 'code_viewer'):
+            self.code_viewer.config(
+                bg=content_bg,
+                fg=content_fg,
+                insertbackground=self.current_theme["fg"],
+                selectbackground=self.current_theme["highlight_bg"],
+                selectforeground=self.current_theme["highlight_fg"]
+            )
+            
+        if hasattr(self, 'instructions_viewer'):
+            self.instructions_viewer.config(
+                bg=content_bg,
+                fg=content_fg, 
+                insertbackground=self.current_theme["fg"],
+                selectbackground=self.current_theme["highlight_bg"],
+                selectforeground=self.current_theme["highlight_fg"]
+            )
+            
+        # Apply to all ScrolledText widgets in the application
+        def update_text_widgets(widget):
+            if isinstance(widget, ScrolledText):
+                widget.config(
+                    bg=content_bg,
+                    fg=content_fg
+                )
+            for child in widget.winfo_children():
+                update_text_widgets(child)
+                
+        update_text_widgets(self.master)
+
+    def apply_theme(self):
+        """Apply the current theme to all widgets"""
+        theme = self.current_theme
+        
+        # Configure root window
+        self.master.configure(bg=theme["bg"])
+        
+        # Configure all frames
+        for widget in self.master.winfo_children():
+            if isinstance(widget, tk.Frame):
+                self.configure_frame_recursive(widget, theme)
+                
+        # Configure the status bar specifically
+        self.status_bar.configure(bg=theme["status_bg"], fg=theme["status_fg"])
+        
+        # Configure treeview
+        style = ttk.Style()
+        style.theme_use('default')  # Reset to default theme first
+        
+        # Configure general ttk elements
+        style.configure(".", 
+                      background=theme["bg"],
+                      foreground=theme["fg"],
+                      fieldbackground=theme["bg"])
+        
+        # Configure Treeview specifically               
+        style.configure("Treeview", 
+                      background=theme["tree_bg"],
+                      foreground=theme["tree_fg"],
+                      fieldbackground=theme["tree_bg"])
+        style.map('Treeview', 
+                background=[('selected', theme["highlight_bg"])],
+                foreground=[('selected', theme["highlight_fg"])])
+        
+        # Configure the notebook
+        style.configure("TNotebook", background=theme["bg"], borderwidth=0)
+        style.configure("TFrame", background=theme["bg"], foreground=theme["fg"])
+        style.configure("TNotebook.Tab", 
+                      background=theme["button_bg"], 
+                      foreground=theme["button_fg"],
+                      padding=[10, 2])
+        style.map("TNotebook.Tab",
+                background=[("selected", theme["highlight_bg"]), 
+                           ("active", theme["highlight_bg"])],
+                foreground=[("selected", theme["highlight_fg"]),
+                           ("active", theme["highlight_fg"])])
+        
+        # More aggressive notebook tab styling
+        self.master.option_add("*TNotebook*Foreground", theme["fg"])
+        self.master.option_add("*TNotebook*Background", theme["bg"])
+        self.master.option_add("*TNotebook.Tab*Background", theme["button_bg"])
+        self.master.option_add("*TNotebook.Tab*Foreground", theme["button_fg"])
+        
+        # Configure scrollbars
+        style.configure("TScrollbar", 
+                       background=theme["button_bg"], 
+                       troughcolor=theme["bg"],
+                       bordercolor=theme["bg"],
+                       arrowcolor=theme["fg"])
+        
+        # Configure combobox
+        style.configure("TCombobox", 
+                       selectbackground=theme["highlight_bg"],
+                       selectforeground=theme["highlight_fg"],
+                       fieldbackground=theme["text_bg"],
+                       background=theme["button_bg"],
+                       foreground=theme["text_fg"])
+        style.map('TCombobox',
+                fieldbackground=[('readonly', theme["text_bg"])],
+                background=[('readonly', theme["button_bg"])],
+                foreground=[('readonly', theme["text_fg"])])
+                
+        # Update content viewer colors
+        self.update_content_viewer_colors()
+                
+        # Force all widgets to update immediately
+        self.master.update_idletasks()
+        
+        # Apply theme to notebook contents
+        if hasattr(self, 'content_viewer'):
+            content_bg = theme.get("content_bg", theme["text_bg"])
+            content_fg = theme.get("content_fg", theme["text_fg"])
+            self.content_viewer.configure(
+                bg=content_bg, 
+                fg=content_fg,
+                insertbackground=theme["fg"],
+                selectbackground=theme["highlight_bg"],
+                selectforeground=theme["highlight_fg"]
+            )
+            
+        if hasattr(self, 'instructions_viewer'):
+            content_bg = theme.get("content_bg", theme["text_bg"])
+            content_fg = theme.get("content_fg", theme["text_fg"])
+            self.instructions_viewer.configure(
+                bg=content_bg, 
+                fg=content_fg,
+                insertbackground=theme["fg"],
+                selectbackground=theme["highlight_bg"],
+                selectforeground=theme["highlight_fg"]
+            )
+            
+        # Apply theme to the content and instructions tabs specifically
+        if hasattr(self, 'history_notebook'):
+            for tab_id in self.history_notebook.tabs():
+                tab = self.history_notebook.nametowidget(tab_id)
+                if isinstance(tab, tk.Frame):
+                    tab.configure(background=theme["bg"])
+                    for child in tab.winfo_children():
+                        if isinstance(child, ScrolledText):
+                            content_bg = theme.get("content_bg", theme["text_bg"])
+                            content_fg = theme.get("content_fg", theme["text_fg"])
+                            child.configure(
+                                bg=content_bg, 
+                                fg=content_fg,
+                                insertbackground=theme["fg"],
+                                selectbackground=theme["highlight_bg"],
+                                selectforeground=theme["highlight_fg"]
+                            )
+                            
+        # Ensure text in the notebook tabs is properly themed
+        if hasattr(self, 'history_notebook'):
+            notebook = self.history_notebook
+            # Force update the notebook tab colors
+            notebook.update()
+            notebook.update_idletasks()
+
+    def configure_frame_recursive(self, frame, theme):
+        """Recursively configure a frame and all its children with theme colors"""
+        frame.configure(bg=theme["frame_bg"])
+        
+        for widget in frame.winfo_children():
+            widget_type = widget.winfo_class()
+            
+            if widget_type == "Frame" or widget_type == "Labelframe":
+                self.configure_frame_recursive(widget, theme)
+                if widget_type == "Labelframe":
+                    widget.configure(fg=theme["fg"], bg=theme["frame_bg"])
+                    
+            elif widget_type == "Label":
+                widget.configure(bg=theme["bg"], fg=theme["fg"])
+                
+            elif widget_type == "Button":
+                widget.configure(bg=theme["button_bg"], fg=theme["button_fg"],
+                               activebackground=theme["highlight_bg"],
+                               activeforeground=theme["highlight_fg"],
+                               highlightbackground=theme["frame_bg"])
+                
+            elif widget_type == "Checkbutton":
+                widget.configure(bg=theme["bg"], fg=theme["fg"],
+                               activebackground=theme["bg"],
+                               activeforeground=theme["highlight_fg"],
+                               selectcolor=theme["button_bg"],
+                               highlightbackground=theme["frame_bg"])
+                
+            elif widget_type == "Listbox":
+                widget.configure(bg=theme["listbox_bg"], fg=theme["listbox_fg"],
+                               selectbackground=theme["highlight_bg"],
+                               selectforeground=theme["highlight_fg"],
+                               highlightbackground=theme["frame_bg"])
+                
+            elif widget_type == "Text" or widget_type == "ScrolledText":
+                widget.configure(bg=theme["text_bg"], fg=theme["text_fg"],
+                               insertbackground=theme["fg"],
+                               selectbackground=theme["highlight_bg"],
+                               selectforeground=theme["highlight_fg"],
+                               highlightbackground=theme["frame_bg"])
+                
+            elif widget_type == "PanedWindow":
+                widget.configure(bg=theme["frame_bg"])
+                for child in widget.panes():
+                    self.configure_frame_recursive(child, theme)
+
+    def handle_undo(self, event, widget):
+        """Handle undo event manually"""
+        try:
+            widget.edit_undo()
+        except tk.TclError:
+            # No more undo operations available
+            pass
+        return "break"  # Prevent default handling
+    
+    def handle_redo(self, event, widget):
+        """Handle redo event manually"""
+        try:
+            widget.edit_redo()
+        except tk.TclError:
+            # No more redo operations available
+            pass
+        return "break"  # Prevent default handling
+    
+    def do_undo(self, widget):
+        """Perform undo on the widget"""
+        try:
+            widget.edit_undo()
+            self.set_status("Undo performed")
+        except tk.TclError:
+            self.set_status("Nothing to undo")
+    
+    def do_redo(self, widget):
+        """Perform redo on the widget"""
+        try:
+            widget.edit_redo()
+            self.set_status("Redo performed")
+        except tk.TclError:
+            self.set_status("Nothing to redo")
+        
+    def set_status(self, message, duration=5000):
+        """Display a status message that disappears after a duration"""
+        # Cancel any existing timer
+        if self.status_timer is not None:
+            self.master.after_cancel(self.status_timer)
+            self.status_timer = None
+            
+        # Set the message with appropriate styling based on content
+        if "error" in message.lower():
+            self.status_bar.config(text=message, bg='#ffcccc', fg='#990000')  # Light red background, dark red text
+        elif "duplicate" in message.lower():
+            self.status_bar.config(text=message, bg='#ffffcc', fg='#666600')  # Light yellow background, dark yellow text
+        elif "copied" in message.lower():
+            self.status_bar.config(text=message, bg='#ccffcc', fg='#006600')  # Light green background, dark green text
+        else:
+            self.status_bar.config(text=message, bg='#f0f0f0', fg='#333333')  # Default styling
+            
+        # Schedule removal
+        self.status_timer = self.master.after(duration, self.clear_status)
+        
+    def clear_status(self):
+        """Clear the status message"""
+        self.status_bar.config(text="Ready", bg='#f0f0f0', fg='#333333')
+        self.status_timer = None
+
+    # -----------------------------------------------------------------------
+    #  ADD/REMOVE FOLDER
+    # -----------------------------------------------------------------------
+    def on_add_folder(self):
+        folder = filedialog.askdirectory(title="Select Folder")
+        if folder:
+            if folder not in self.root_folders:
+                self.root_folders.append(folder)
+                self.build_tree_for(folder)
+                self.save_settings()
+                self.set_status(f"Added folder: {folder}")
+            else:
+                self.set_status("That folder is already in the list.")
+
+    def on_remove_folder(self):
+        if not self.root_folders:
+            self.set_status("There are no root folders to remove.")
+            return
+
+        remove_win = tk.Toplevel(self.master)
+        remove_win.title("Remove Folder")
+
+        tk.Label(remove_win, text="Select a root folder to remove:").pack(anchor=tk.W, padx=5, pady=5)
+
+        listbox = tk.Listbox(remove_win, height=6)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        for rf in self.root_folders:
+            listbox.insert(tk.END, rf)
+
+        def do_remove():
+            sel = listbox.curselection()
+            if sel:
+                idx = sel[0]
+                folder_to_remove = self.root_folders[idx]
+                self.root_folders.pop(idx)
+                self.remove_subtree(folder_to_remove)
+                remove_win.destroy()
+                self.save_settings()
+                self.set_status(f"Removed folder: {folder_to_remove}")
+
+        btn_remove = tk.Button(remove_win, text="Remove Selected", command=do_remove)
+        btn_remove.pack(side=tk.RIGHT, padx=5, pady=5)
+
+    def remove_subtree(self, folder_path):
+        """Remove the given folder_path (and all descendants) from folder_tree_data + TreeView."""
+        stack = [folder_path]
+        to_delete_tree_ids = []
+        while stack:
+            current = stack.pop()
+            if current in self.tree_ids_map:
+                to_delete_tree_ids.append(self.tree_ids_map[current])
+            if current in self.folder_tree_data:
+                del self.folder_tree_data[current]
+            if current in self.tree_ids_map:
+                del self.tree_ids_map[current]
+
+            # find children
+            for p in list(self.folder_tree_data.keys()):
+                if os.path.dirname(p) == current:
+                    stack.append(p)
+
+        for tid in to_delete_tree_ids:
+            if self.tree.exists(tid):
+                self.tree.delete(tid)
+
+    # -----------------------------------------------------------------------
+    #  BUILDING/REFRESHING TREE
+    # -----------------------------------------------------------------------
+    def build_all_trees(self):
+        """
+        Clear everything, then build a tree for each folder in self.root_folders.
+        Reset self.visited_dirs each time we do a full rebuild.
+        """
+        self.folder_tree_data.clear()
+        self.tree_ids_map.clear()
+        self.tree.delete(*self.tree.get_children())
+        self.visited_dirs = set()
+
+        for folder in self.root_folders:
+            if not os.path.exists(folder):
+                continue
+            self.build_tree_for(folder)
+
+        # apply saved checks
+        self.apply_saved_checks()
+
+    def build_tree_for(self, folder):
+        """
+        Recursively add 'folder' and all its sub-items to the TreeView,
+        skipping directories we've visited or that match ignore patterns.
+        """
+        realp = os.path.realpath(folder)
+        if realp in self.visited_dirs:
+            return
+        self.visited_dirs.add(realp)
+
+        if folder not in self.folder_tree_data:
+            self.folder_tree_data[folder] = {'checked': False, 'is_dir': True}
+
+        root_text = os.path.basename(folder) or folder
+        root_id = self.tree.insert("", tk.END, text=root_text, open=False)
+        self.tree_ids_map[folder] = root_id
+
+        self.add_directory_contents(folder, root_id)
+        self.tree.item(root_id, open=True)
+
+    def add_directory_contents(self, directory_path, parent_id):
+        try:
+            items = sorted(os.listdir(directory_path))
+        except PermissionError:
+            return
+
+        for item in items:
+            path = os.path.join(directory_path, item)
+
+            # If ignore, skip
+            if self.filters_match(path):
+                continue
+
+            # If physically the same as parent, skip (avoid repeated folder name)
+            parent_real = os.path.realpath(directory_path)
+            child_real = os.path.realpath(path)
+            if os.path.samefile(directory_path, path):
+                # This means child is literally the same as the parent
+                continue
+
+            if child_real in self.visited_dirs and os.path.isdir(path):
+                # Already processed this directory
+                continue
+
+            is_dir = os.path.isdir(path)
+            self.folder_tree_data[path] = {'checked': False, 'is_dir': is_dir}
+
+            node_id = self.tree.insert(parent_id, tk.END, text=item, open=False)
+            self.tree_ids_map[path] = node_id
+
+            if is_dir:
+                self.visited_dirs.add(child_real)
+                self.add_directory_contents(path, node_id)
+
+    def apply_saved_checks(self):
+        """Apply saved check states from config, respecting filters."""
+        for path, checked in self.saved_folder_checks.items():
+            # Only apply checks to paths that:
+            # 1. Exist in the folder tree data
+            # 2. Are not filtered out by ignore patterns
+            if path in self.folder_tree_data and not self.filters_match(path):
+                self.folder_tree_data[path]['checked'] = checked
+                item_id = self.tree_ids_map.get(path)
+                if item_id:
+                    text = self.tree.item(item_id, 'text')
+                    if checked and not text.startswith("[x] "):
+                        self.tree.item(item_id, text="[x] " + text)
+                    elif not checked and text.startswith("[x] "):
+                        self.tree.item(item_id, text=text.replace("[x] ", "", 1))
+        
+        # Clear saved checks after applying
+        self.saved_folder_checks = {}
+
+    # -----------------------------------------------------------------------
+    #  IGNORE PATTERNS
+    # -----------------------------------------------------------------------
+    def filters_match(self, path):
+        """
+        Check if a path matches any of the ignore patterns.
+        Returns True if the path should be ignored.
+        """
+        fpath = path.replace("\\", "/")
+        
+        # Check user-defined ignore patterns
+        for pat in self.ignore_patterns:
+            pclean = pat.strip()
+            if pclean and fnmatch.fnmatch(fpath, pclean):
+                return True
+                
+        # Only check default ignore patterns if the filter is enabled
+        if self.filter_system_folders.get():
+            # Also check default ignore patterns
+            for pat in self.default_ignore_patterns:
+                pclean = pat.strip()
+                if pclean and fnmatch.fnmatch(fpath, pclean):
+                    return True
+            
+            # Check if file/folder is hidden (starts with dot)
+            basename = os.path.basename(path)
+            if basename.startswith('.') and len(basename) > 1:  # Skip '.' and '..' directories
+                return True
+            
+        return False
+
+    def on_save_filters(self):
+        raw = self.filters_text.get("1.0", tk.END)
+        lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+        self.ignore_patterns = lines
+        # Rebuild everything
+        self.build_all_trees()
+        self.save_settings()
+        self.set_status("Ignore patterns saved & tree refreshed.")
+
+    # -----------------------------------------------------------------------
+    #  POLLING
+    # -----------------------------------------------------------------------
+    def schedule_folder_poll(self):
+        self.poll_folder()
+        self.master.after(self.poll_interval_ms, self.schedule_folder_poll)
+
+    def poll_folder(self):
+        """
+        Check for new items in each root folder using os.walk,
+        skip if ignore or visited, also skip if child is samefile() as parent.
+        """
+        for folder in self.root_folders:
+            if not os.path.exists(folder):
+                continue
+            for root, dirs, files in os.walk(folder):
+                root_real = os.path.realpath(root)
+                # skip if root is ignored or visited
+                if self.filters_match(root) or (root_real in self.visited_dirs):
+                    continue
+
+                # If not in data => new subfolder
+                if root not in self.folder_tree_data:
+                    self.folder_tree_data[root] = {'checked': False, 'is_dir': True}
+                    parent = os.path.dirname(root)
+                    if parent in self.tree_ids_map:
+                        node_id = self.tree.insert(self.tree_ids_map[parent], tk.END,
+                                                   text=os.path.basename(root), open=False)
+                        self.tree_ids_map[root] = node_id
+                    self.visited_dirs.add(root_real)
+
+                for d in dirs:
+                    dpath = os.path.join(root, d)
+                    dreal = os.path.realpath(dpath)
+                    if self.filters_match(dpath) or (dreal in self.visited_dirs):
+                        continue
+                    if os.path.samefile(root, dpath):
+                        continue
+                    if dpath not in self.folder_tree_data:
+                        self.folder_tree_data[dpath] = {'checked': False, 'is_dir': True}
+                        if root in self.tree_ids_map:
+                            node_id = self.tree.insert(self.tree_ids_map[root], tk.END, text=d, open=False)
+                            self.tree_ids_map[dpath] = node_id
+                        self.visited_dirs.add(dreal)
+
+                for f in files:
+                    fpath = os.path.join(root, f)
+                    freal = os.path.realpath(fpath)
+                    if self.filters_match(fpath) or (freal in self.visited_dirs):
+                        continue
+                    if os.path.samefile(root, fpath):
+                        continue
+                    if fpath not in self.folder_tree_data:
+                        self.folder_tree_data[fpath] = {'checked': False, 'is_dir': False}
+                        if root in self.tree_ids_map:
+                            node_id = self.tree.insert(self.tree_ids_map[root], tk.END, text=f, open=False)
+                            self.tree_ids_map[fpath] = node_id
+                        self.visited_dirs.add(freal)
+
+    # -----------------------------------------------------------------------
+    #  CHECK / UNCHECK
+    # -----------------------------------------------------------------------
+    def on_tree_item_double_click(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        path = self.find_path_by_tree_id(item_id)
+        if not path:
+            return
+        current = self.folder_tree_data[path]['checked']
+        new_state = not current
+        self.set_subtree_checked(path, new_state)
+        self.save_settings()
+
+    def set_subtree_checked(self, path, checked):
+        """Mark path and all its children as checked/unchecked."""
+        # Update internal data structure
+        self.folder_tree_data[path]['checked'] = checked
+        
+        # Update UI
+        item_id = self.tree_ids_map.get(path)
+        if item_id:
+            text = self.tree.item(item_id, 'text')
+            text_without_check = text.replace("[x] ", "", 1) if text.startswith("[x] ") else text
+            
+            if checked:
+                self.tree.item(item_id, text=f"[x] {text_without_check}")
+            else:
+                self.tree.item(item_id, text=text_without_check)
+
+        # Recursively update children if this is a directory
+        if self.folder_tree_data[path]['is_dir']:
+            for p in list(self.folder_tree_data.keys()):
+                if os.path.dirname(p) == path:
+                    self.set_subtree_checked(p, checked)
+
+    def find_path_by_tree_id(self, tree_id):
+        for p, tid in self.tree_ids_map.items():
+            if tid == tree_id:
+                return p
+        return None
+
+    # -----------------------------------------------------------------------
+    #  META PROMPTS
+    # -----------------------------------------------------------------------
+    def on_add_prompt(self):
+        def save_prompt():
+            title = entry_title.get().strip()
+            content = text_content.get("1.0", tk.END).strip()
+            if title:
+                self.meta_prompts.append({"title": title, "content": content, "checked": True})
+                prompt_win.destroy()
+                self.refresh_prompts_listbox()
+                self.save_settings()
+
+        prompt_win = tk.Toplevel(self.master)
+        prompt_win.title("New Meta Prompt")
+
+        tk.Label(prompt_win, text="Title:").pack(anchor=tk.W, padx=5, pady=2)
+        entry_title = tk.Entry(prompt_win, width=40)
+        entry_title.pack(fill=tk.X, padx=5, pady=2)
+
+        tk.Label(prompt_win, text="Content:").pack(anchor=tk.W, padx=5, pady=2)
+        text_content = ScrolledText(prompt_win, height=6, width=40)
+        text_content.pack(fill=tk.BOTH, padx=5, pady=2)
+
+        btn_save = tk.Button(prompt_win, text="Save Prompt", command=save_prompt)
+        btn_save.pack(side=tk.RIGHT, padx=5, pady=5)
+
+    def refresh_prompts_listbox(self):
+        self.prompts_listbox.delete(0, tk.END)
+        for prompt in self.meta_prompts:
+            prefix = "[x]" if prompt['checked'] else "[ ]"
+            self.prompts_listbox.insert(tk.END, f"{prefix} {prompt['title']}")
+
+    def on_toggle_prompt(self):
+        idxs = self.prompts_listbox.curselection()
+        if not idxs:
+            return
+        idx = idxs[0]
+        self.meta_prompts[idx]['checked'] = not self.meta_prompts[idx]['checked']
+        self.refresh_prompts_listbox()
+        self.save_settings()
+        prompt_status = "enabled" if self.meta_prompts[idx]['checked'] else "disabled"
+        self.set_status(f"Meta prompt {self.meta_prompts[idx]['title']} {prompt_status}.")
+
+    def on_remove_prompt(self):
+        idxs = self.prompts_listbox.curselection()
+        if not idxs:
+            return
+        idx = idxs[0]
+        del self.meta_prompts[idx]
+        self.refresh_prompts_listbox()
+        self.save_settings()
+
+    def on_edit_prompt(self):
+        idxs = self.prompts_listbox.curselection()
+        if not idxs:
+            return
+        idx = idxs[0]
+        prompt = self.meta_prompts[idx]
+
+        def save_edited_prompt():
+            title = entry_title.get().strip()
+            content = text_content.get("1.0", tk.END).strip()
+            if title:
+                prompt["title"] = title
+                prompt["content"] = content
+                edit_win.destroy()
+                self.refresh_prompts_listbox()
+                self.save_settings()
+
+        edit_win = tk.Toplevel(self.master)
+        edit_win.title("Edit Meta Prompt")
+
+        tk.Label(edit_win, text="Title:").pack(anchor=tk.W, padx=5, pady=2)
+        entry_title = tk.Entry(edit_win, width=40)
+        entry_title.pack(fill=tk.X, padx=5, pady=2)
+        entry_title.insert(0, prompt["title"])
+
+        tk.Label(edit_win, text="Content:").pack(anchor=tk.W, padx=5, pady=2)
+        text_content = ScrolledText(edit_win, height=6, width=40)
+        text_content.pack(fill=tk.BOTH, padx=5, pady=2)
+        text_content.insert("1.0", prompt["content"])
+
+        btn_save = tk.Button(edit_win, text="Save Changes", command=save_edited_prompt)
+        btn_save.pack(side=tk.RIGHT, padx=5, pady=5)
+
+    # -----------------------------------------------------------------------
+    #  USER INSTRUCTIONS
+    # -----------------------------------------------------------------------
+    def on_instructions_modified(self, event):
+        if self.instructions_text.edit_modified():
+            self.instructions_text.edit_modified(False)
+            self.user_instructions = self.instructions_text.get("1.0", tk.END).strip()
+            self.save_settings()
+
+    def toggle_instructions_size(self):
+        """Toggle between compact and expanded instructions view."""
+        is_expanded = self.instructions_expanded.get()
+        if is_expanded:
+            self.instructions_text.configure(height=4)
+            self.expand_btn.configure(text="Expand")
+        else:
+            self.instructions_text.configure(height=20)
+            self.expand_btn.configure(text="Collapse")
+        self.instructions_expanded.set(not is_expanded)
+
+    # -----------------------------------------------------------------------
+    #  COPY TO CLIPBOARD
+    # -----------------------------------------------------------------------
+    def on_copy_to_clipboard(self):
+        self.user_instructions = self.instructions_text.get("1.0", tk.END).strip()
+        
+        # Verify that checked items still exist and are accessible
+        # This prevents filter-hidden items from being selected
+        self.validate_checked_items()
+        
+        if self.copy_entire_tree_var.get():
+            file_tree_block = self.build_full_file_tree_text()
+        else:
+            file_tree_block = self.build_checked_file_tree_text()
+
+        file_contents_block = self.build_file_contents_text()
+        meta_prompts_block = self.build_meta_prompts_text()
+        user_instructions_block = f"<user_instructions>\n{self.user_instructions}\n</user_instructions>"
+
+        final_clip = (
+            f"<file_tree>\n{file_tree_block}\n</file_tree>\n\n"
+            f"<file_contents>\n{file_contents_block}\n</file_contents>\n\n"
+            f"{meta_prompts_block}\n"
+            f"{user_instructions_block}\n"
+        )
+
+        # Check if this content is identical to the most recent history item
+        is_duplicate = False
+        if self.history_items:
+            latest_history_path = os.path.join(self.history_items[0]['path'], "content.txt")
+            try:
+                if os.path.exists(latest_history_path):
+                    with open(latest_history_path, 'r', encoding='utf-8') as f:
+                        last_content = f.read()
+                    if last_content == final_clip:
+                        is_duplicate = True
+            except Exception:
+                # If there's any error reading the file, assume it's not a duplicate
+                pass
+
+        # Only save to history if it's not a duplicate
+        if not is_duplicate:
+            self.save_history_item(final_clip, self.user_instructions)
+            self.set_status("Data copied to clipboard and saved to history.")
+        else:
+            self.set_status("Data copied to clipboard (duplicate not saved to history).")
+
+        self.master.clipboard_clear()
+        self.master.clipboard_append(final_clip)
+        self.save_settings()
+        
+    def validate_checked_items(self):
+        """
+        Ensure that only items that are visible and explicitly checked
+        remain marked as checked in the data structure.
+        """
+        # Create a set of visible paths
+        visible_paths = set()
+        for path in self.folder_tree_data:
+            # Skip items that match filters
+            if self.filters_match(path):
+                # If this was checked, uncheck it since it's filtered
+                if path in self.folder_tree_data and self.folder_tree_data[path]['checked']:
+                    print(f"Unchecking filtered item: {path}")
+                    self.folder_tree_data[path]['checked'] = False
+                continue
+                
+            # Item is visible
+            visible_paths.add(path)
+        
+        # Now go through and ensure only visible items can be checked
+        for path in list(self.folder_tree_data.keys()):
+            # If the path isn't visible but is checked, uncheck it
+            if path not in visible_paths and self.folder_tree_data[path]['checked']:
+                print(f"Unchecking non-visible item: {path}")
+                self.folder_tree_data[path]['checked'] = False
+
+    # -----------------------------------------------------------------------
+    #  BUILD FILE TREE: FULL vs CHECKED
+    # -----------------------------------------------------------------------
+    def build_checked_file_tree_text(self):
+        """
+        Build a text representation of ONLY checked items in the tree.
+        Unchecked parent folders won't be shown.
+        """
+        if not self.root_folders:
+            return "No folders selected."
+
+        # Get all explicitly checked paths
+        checked_paths = [path for path, info in self.folder_tree_data.items() 
+                        if info['checked']]
+        
+        if not checked_paths:
+            return "(No items selected)"
+
+        # Sort paths for consistent output
+        checked_paths.sort()
+        
+        # Debug what we're including in the tree
+        print(f"Including {len(checked_paths)} checked items in file tree:")
+        for path in checked_paths:
+            is_dir = self.folder_tree_data[path]['is_dir']
+            print(f"  - {'[DIR] ' if is_dir else ''}{path}")
+        
+        # Organize by directories for a cleaner view
+        # First, separate directories and files
+        checked_dirs = [path for path in checked_paths if self.folder_tree_data[path]['is_dir']]
+        checked_files = [path for path in checked_paths if not self.folder_tree_data[path]['is_dir']]
+        
+        # Build lines for the output
+        lines = []
+        
+        # First add any checked directories
+        for dir_path in checked_dirs:
+            lines.append(dir_path)  # Add the directory path
+            
+            # Look for any checked files that are direct children of this directory
+            child_files = [f for f in checked_files if os.path.dirname(f) == dir_path]
+            if child_files:
+                # Sort child files for consistent output
+                child_files.sort()
+                # Add each child file with indentation
+                for i, child in enumerate(child_files):
+                    is_last = (i == len(child_files) - 1)
+                    branch = "└── " if is_last else "├── "
+                    lines.append(f"    {branch}{os.path.basename(child)}")
+                    # Remove from checked_files so we don't process it again
+                    checked_files.remove(child)
+                    
+        # Now add any remaining checked files that aren't children of checked directories
+        for file_path in checked_files:
+            lines.append(file_path)
+            
+        return "\n".join(lines)
+
+    def build_full_file_tree_text(self):
+        if not self.root_folders:
+            return "No folders selected."
+
+        lines = []
+
+        def recurse(path, prefix=""):
+            basename = os.path.basename(path) or path
+            if prefix == "":
+                lines.append(path)
+            else:
+                lines.append(f"{prefix}{basename}")
+
+            children = [p for p in self.folder_tree_data if os.path.dirname(p) == path]
+            subdirs = [c for c in children if self.folder_tree_data[c]['is_dir']]
+            subfiles = [c for c in children if not self.folder_tree_data[c]['is_dir']]
+            subdirs.sort()
+            subfiles.sort()
+            all_items = subdirs + subfiles
+
+            for i, child in enumerate(all_items):
+                is_last = (i == len(all_items) - 1)
+                branch = "└── " if is_last else "├── "
+                deeper_prefix = "    " if is_last else "│   "
+
+                if self.folder_tree_data[child]['is_dir']:
+                    recurse(child, prefix + branch)  # Remove extra line for directory
+                else:
+                    lines.append(prefix + branch + os.path.basename(child))
+
+        for rf in self.root_folders:
+            if os.path.exists(rf) and rf in self.folder_tree_data:
+                recurse(rf)
+
+        return "\n".join(lines)
+
+    # -----------------------------------------------------------------------
+    #  BUILD FILE CONTENTS + META PROMPTS
+    # -----------------------------------------------------------------------
+    def build_file_contents_text(self):
+        """Build a text representation of the contents of checked files."""
+        lines = []
+        
+        # Get a list of all checked files (not directories)
+        checked_files = [path for path, info in self.folder_tree_data.items() 
+                        if info['checked'] and not info['is_dir']]
+        
+        # Sort them for consistent output
+        checked_files.sort()
+        
+        # Debug info about what's being copied
+        print(f"Copying {len(checked_files)} checked files:")
+        for path in checked_files:
+            print(f"  - {path}")
+        
+        # Build the content for each file
+        for path in checked_files:
+            filename = os.path.basename(path)
+            ext = os.path.splitext(filename)[1].lstrip('.') or "txt"
+            lines.append(f"File: {path}")
+            lines.append(f"```{ext}")
+            try:
+                content = read_file_with_fallback(path)
+                lines.append(content)
+            except Exception as e:
+                lines.append(f"<Error reading file: {e}>")
+            lines.append("```")
+            lines.append("")
+            
+        return "\n".join(lines)
+
+    def build_meta_prompts_text(self):
+        lines = []
+        idx = 1
+        for prompt in self.meta_prompts:
+            if prompt['checked']:
+                lines.append(f"<meta prompt {idx}=\"{prompt['title']}\">")
+                lines.append(prompt['content'])
+                lines.append(f"</meta prompt {idx}>")
+                idx += 1
+        return "\n".join(lines)
+
+    # -----------------------------------------------------------------------
+    #  SAVE / LOAD
+    # -----------------------------------------------------------------------
+    def save_settings(self):
+        """Save settings to either default or profile."""
+        if self.current_profile == "default":
+            try:
+                with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                    data = {
+                        "root_folders": self.root_folders,
+                        "user_instructions": self.user_instructions,
+                        "meta_prompts": self.meta_prompts,
+                        "folder_checks": {},
+                        "ignore_patterns": self.ignore_patterns,
+                        "copy_entire_tree": self.copy_entire_tree_var.get(),
+                        "filter_system_folders": self.filter_system_folders.get(),
+                        "dark_mode": self.dark_mode.get()
+                    }
+                    for path, info in self.folder_tree_data.items():
+                        data["folder_checks"][path] = info['checked']
+                    json.dump(data, f, indent=2)
+            except Exception as e:
+                messagebox.showerror("Error Saving Settings", str(e))
+        else:
+            self.save_profile(self.current_profile)
+
+    def load_settings(self):
+        """Load settings from either default or profile."""
+        is_first_launch = False
+        
+        if self.current_profile == "default":
+            if not os.path.exists(CONFIG_FILE):
+                # Add default meta prompt and ignore patterns for new installations
+                self.add_default_meta_prompts()
+                self.ignore_patterns = self.default_initial_ignore_patterns.copy()
+                is_first_launch = True
+                # We'll skip loading from file but still update the UI
+                self.save_settings()  # Create the file for next time
+            else:
+                config_path = CONFIG_FILE
+        else:
+            config_path = os.path.join(PROFILES_DIR, f"{self.current_profile}.json")
+            if not os.path.exists(config_path):
+                # Add defaults for new profile
+                self.add_default_meta_prompts()
+                self.ignore_patterns = self.default_initial_ignore_patterns.copy()
+                is_first_launch = True
+                self.save_settings()  # Create the file for next time
+        
+        if not is_first_launch:  # Only load from file if it's not first launch
+            try:
+                # Clear existing data
+                self.folder_tree_data.clear() 
+                self.tree_ids_map.clear()
+                self.saved_folder_checks.clear()
+                self.visited_dirs.clear()
+                
+                # Remove all items from tree view
+                self.tree.delete(*self.tree.get_children())
+                
+                # Load new settings
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                self.root_folders = data.get("root_folders", [])
+                self.user_instructions = data.get("user_instructions", "")
+                self.meta_prompts = data.get("meta_prompts", [])
+                # Check if we need to add the default meta prompt
+                if not self.meta_prompts:
+                    self.add_default_meta_prompts()
+                
+                self.saved_folder_checks = data.get("folder_checks", {})
+                self.ignore_patterns = data.get("ignore_patterns", [])
+                self.copy_entire_tree_var.set(data.get("copy_entire_tree", False))
+                self.filter_system_folders.set(data.get("filter_system_folders", True))
+                self.dark_mode.set(data.get("dark_mode", False))
+            except Exception as e:
+                messagebox.showerror("Error Loading Settings", str(e))
+        
+        # Always update the UI, whether it's first launch or not
+        
+        # Build the tree with current settings
+        self.build_all_trees()
+        
+        # Update UI
+        if hasattr(self, 'instructions_text'):
+            self.instructions_text.delete("1.0", tk.END)
+            self.instructions_text.insert("1.0", self.user_instructions)
+        
+        if hasattr(self, 'filters_text'):
+            self.filters_text.delete("1.0", tk.END)
+            self.filters_text.insert("1.0", "\n".join(self.ignore_patterns))
+        
+        self.refresh_prompts_listbox()
+        
+        # Load history for this profile
+        self.load_history()
+
+    def add_default_meta_prompts(self):
+        """Add default meta prompts for new installations or empty profiles."""
+        # Check if we already have a meta prompt with this title
+        existing_titles = [p["title"] for p in self.meta_prompts]
+        
+        if "Please Provide Code in Chat" not in existing_titles:
+            self.meta_prompts.append({
+                "title": "Please Provide Code in Chat",
+                "content": "Please provide all code and edits directly in the chat interface, not in a code editor or canvas. This makes it easier for me to copy and implement your suggestions in my development environment.\n\nWhen suggesting code edits, please:\n- Clearly indicate which files to modify\n- Specify the locations for changes (line numbers, function names, etc.)\n- Show complete code blocks with enough context to locate the edit points\n- Format your response in a way that's easy to copy from chat",
+                "checked": True
+            })
+            self.save_settings()
+
+    def get_available_profiles(self):
+        """Get list of available profile names."""
+        profiles = ["default"]
+        if os.path.exists(PROFILES_DIR):
+            for f in os.listdir(PROFILES_DIR):
+                if f.endswith('.json'):
+                    profiles.append(os.path.splitext(f)[0])
+        return sorted(profiles)
+
+    def on_refresh_folders(self):
+        """Refresh the folder tree while preserving selections."""
+        # Store current selections
+        selections = {path: info['checked'] for path, info in self.folder_tree_data.items()}
+        
+        # Clear visited dirs to allow re-scanning
+        self.visited_dirs.clear()
+        
+        # Rebuild trees
+        self.folder_tree_data.clear()
+        self.tree_ids_map.clear()
+        self.tree.delete(*self.tree.get_children())
+        
+        # Rebuild all trees
+        for folder in self.root_folders:
+            if not os.path.exists(folder):
+                continue
+            self.build_tree_for(folder)
+        
+        # Restore selections
+        for path, was_checked in selections.items():
+            if path in self.folder_tree_data:
+                self.folder_tree_data[path]['checked'] = was_checked
+                item_id = self.tree_ids_map.get(path)
+                if item_id and was_checked:
+                    text = self.tree.item(item_id, 'text')
+                    if not text.startswith("[x] "):
+                        self.tree.item(item_id, text="[x] " + text)
+        
+        # Validate checked items to ensure consistency
+        self.validate_checked_items()
+
+    def on_new_profile(self):
+        """Create a new profile."""
+        def save_new_profile():
+            name = entry_name.get().strip()
+            if not name:
+                error_label.config(text="Profile name cannot be empty")
+                return
+            if name == "default":
+                error_label.config(text="Cannot use 'default' as profile name")
+                return
+            if name in self.profiles:
+                error_label.config(text="Profile already exists")
+                return
+            
+            self.current_profile = name
+            self.profile_var.set(name)
+            self.profiles.append(name)
+            self.profile_combo['values'] = self.profiles
+            
+            # Clear the file list and user instructions for the new profile
+            self.root_folders = []
+            self.user_instructions = ""
+            
+            # Clear the folder tree data and tree view
+            self.folder_tree_data.clear()
+            self.tree_ids_map.clear()
+            self.visited_dirs.clear()
+            self.tree.delete(*self.tree.get_children())
+            
+            self.save_settings()
+            new_win.destroy()
+            self.set_status(f"Created new profile: {name}")
+        
+        new_win = tk.Toplevel(self.master)
+        new_win.title("New Profile")
+        
+        tk.Label(new_win, text="Profile Name:").pack(padx=5, pady=5)
+        entry_name = tk.Entry(new_win)
+        entry_name.pack(padx=5, pady=5)
+        
+        error_label = tk.Label(new_win, text="", fg="red")
+        error_label.pack(padx=5, pady=2)
+        
+        tk.Button(new_win, text="Create", command=save_new_profile).pack(padx=5, pady=5)
+
+    def on_update_profile(self):
+        """Update current profile."""
+        if self.current_profile == "default":
+            self.save_settings()
+        else:
+            self.save_profile(self.current_profile)
+        self.set_status(f"Profile '{self.current_profile}' updated")
+
+    def on_delete_profile(self):
+        """Delete current profile."""
+        if self.current_profile == "default":
+            self.set_status("Cannot delete default profile", 5000)
+            return
+        
+        confirm_win = tk.Toplevel(self.master)
+        confirm_win.title("Confirm Delete")
+        confirm_win.geometry("300x120")
+        confirm_win.resizable(False, False)
+        
+        msg = f"Delete profile '{self.current_profile}'?"
+        tk.Label(confirm_win, text=msg, wraplength=280).pack(padx=10, pady=10)
+        
+        btn_frame = tk.Frame(confirm_win)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+        
+        def do_delete():
+            profile_path = os.path.join(PROFILES_DIR, f"{self.current_profile}.json")
+            if os.path.exists(profile_path):
+                os.remove(profile_path)
+            
+            self.profiles.remove(self.current_profile)
+            self.current_profile = "default"
+            self.profile_var.set("default")
+            self.profile_combo['values'] = self.profiles
+            self.load_settings()
+            
+            confirm_win.destroy()
+            self.set_status(f"Profile deleted successfully.")
+        
+        btn_yes = tk.Button(btn_frame, text="Yes", command=do_delete, width=10)
+        btn_yes.pack(side=tk.LEFT, padx=5)
+        
+        btn_no = tk.Button(btn_frame, text="No", command=confirm_win.destroy, width=10)
+        btn_no.pack(side=tk.LEFT, padx=5)
+
+    def on_profile_selected(self, event):
+        """Handle profile selection change."""
+        new_profile = self.profile_var.get()
+        if new_profile != self.current_profile:
+            # Save current profile before switching
+            self.save_settings()
+            
+            # Switch to new profile
+            self.current_profile = new_profile
+            
+            # Clear all data structures completely
+            self.folder_tree_data.clear()
+            self.tree_ids_map.clear()
+            self.saved_folder_checks.clear()
+            self.visited_dirs.clear()
+            
+            # Remove all items from tree view
+            self.tree.delete(*self.tree.get_children())
+            
+            # Load the new profile
+            self.load_settings()
+            
+            # Validate checked items
+            self.validate_checked_items()
+            
+            # Clear history selection
+            self.selected_history_item = None
+
+    def save_profile(self, profile_name):
+        """Save settings to a specific profile."""
+        data = {
+            "root_folders": self.root_folders,
+            "user_instructions": self.user_instructions,
+            "meta_prompts": self.meta_prompts,
+            "folder_checks": {},
+            "ignore_patterns": self.ignore_patterns,
+            "copy_entire_tree": self.copy_entire_tree_var.get(),
+            "filter_system_folders": self.filter_system_folders.get(),
+            "dark_mode": self.dark_mode.get()
+        }
+        for path, info in self.folder_tree_data.items():
+            data["folder_checks"][path] = info['checked']
+
+        profile_path = os.path.join(PROFILES_DIR, f"{profile_name}.json")
+        try:
+            with open(profile_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Error Saving Profile", str(e))
+
+    def on_toggle_system_filter(self):
+        """Handle the system folder filter toggle."""
+        # Rebuild the tree when the filter changes
+        self.visited_dirs.clear()
+        self.build_all_trees()
+        
+        # Save settings
+        self.save_settings()
+
+    # -----------------------------------------------------------------------
+    #  HISTORY MANAGEMENT
+    # -----------------------------------------------------------------------
+    def load_history(self):
+        """Load history items for the current profile."""
+        self.history_items = []
+        profile_history_dir = os.path.join(HISTORY_DIR, self.current_profile)
+        
+        if not os.path.exists(profile_history_dir):
+            os.makedirs(profile_history_dir)
+            return
+            
+        # Get all history directories sorted by timestamp (newest first)
+        history_dirs = []
+        for item in os.listdir(profile_history_dir):
+            item_path = os.path.join(profile_history_dir, item)
+            if os.path.isdir(item_path):
+                try:
+                    # Extract timestamp from directory name
+                    timestamp = int(item)
+                    history_dirs.append((timestamp, item_path))
+                except ValueError:
+                    continue
+                    
+        # Sort by timestamp (descending)
+        history_dirs.sort(reverse=True)
+        
+        # Load each history item
+        for _, dir_path in history_dirs:
+            meta_path = os.path.join(dir_path, "meta.json")
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, 'r', encoding='utf-8') as f:
+                        meta = json.load(f)
+                        self.history_items.append({
+                            'path': dir_path,
+                            'timestamp': meta.get('timestamp', 0),
+                            'datetime': meta.get('datetime', ''),
+                            'description': meta.get('description', ''),
+                            'file_count': meta.get('file_count', 0)
+                        })
+                except Exception as e:
+                    print(f"Error loading history item: {e}")
+                    
+        # Update history listbox
+        self.refresh_history_listbox()
+        
+    def refresh_history_listbox(self):
+        """Update the history listbox with current items."""
+        self.history_listbox.delete(0, tk.END)
+        for item in self.history_items:
+            self.history_listbox.insert(tk.END, f"{item['datetime']} - {item['description']} ({item['file_count']} files)")
+            
+    def save_history_item(self, full_content, user_instructions):
+        """Save a new history item with the given content and instructions."""
+        # Create timestamp for unique ID
+        timestamp = int(time.time())
+        dt_string = datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")  # 12-hour time with AM/PM
+        
+        # Create directory for this history item
+        profile_history_dir = os.path.join(HISTORY_DIR, self.current_profile)
+        if not os.path.exists(profile_history_dir):
+            os.makedirs(profile_history_dir)
+            
+        history_item_dir = os.path.join(profile_history_dir, str(timestamp))
+        os.makedirs(history_item_dir)
+        
+        # Save content and instructions to files
+        content_path = os.path.join(history_item_dir, "content.txt")
+        with open(content_path, 'w', encoding='utf-8') as f:
+            f.write(full_content)
+            
+        instructions_path = os.path.join(history_item_dir, "instructions.txt")
+        with open(instructions_path, 'w', encoding='utf-8') as f:
+            f.write(user_instructions)
+            
+        # Count files in content
+        file_count = full_content.count("<file_contents>")
+        
+        # Create description
+        description = f"Copy from {self.current_profile}"
+        
+        # Save metadata
+        meta = {
+            'timestamp': timestamp,
+            'datetime': dt_string,
+            'description': description,
+            'file_count': file_count
+        }
+        
+        meta_path = os.path.join(history_item_dir, "meta.json")
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2)
+            
+        # Add to history items and refresh listbox
+        self.history_items.insert(0, {
+            'path': history_item_dir,
+            'timestamp': timestamp,
+            'datetime': dt_string,
+            'description': description,
+            'file_count': file_count
+        })
+        
+        self.refresh_history_listbox()
+        
+    def on_history_item_selected(self, event):
+        """Handle selection of a history item."""
+        selection = self.history_listbox.curselection()
+        if not selection:
+            return
+            
+        index = selection[0]
+        if 0 <= index < len(self.history_items):
+            self.selected_history_item = self.history_items[index]
+            
+            # Load content and instructions into viewers
+            content_path = os.path.join(self.selected_history_item['path'], "content.txt")
+            instructions_path = os.path.join(self.selected_history_item['path'], "instructions.txt")
+            
+            # Update content viewer
+            self.content_viewer.config(state=tk.NORMAL)
+            self.content_viewer.delete("1.0", tk.END)
+            try:
+                if os.path.exists(content_path):
+                    with open(content_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    self.content_viewer.insert("1.0", content)
+                    
+                    # Extract code content for the Code tab (include both tree and contents)
+                    self.code_viewer.config(state=tk.NORMAL)
+                    self.code_viewer.delete("1.0", tk.END)
+                    
+                    # Extract both file tree and file contents
+                    code_sections = []
+                    
+                    # Extract file tree
+                    if "<file_tree>" in content and "</file_tree>" in content:
+                        file_tree = content.split("<file_tree>")[1].split("</file_tree>")[0].strip()
+                        code_sections.append("<file_tree>\n" + file_tree + "\n</file_tree>")
+                    
+                    # Extract file contents
+                    if "<file_contents>" in content and "</file_contents>" in content:
+                        file_contents = content.split("<file_contents>")[1].split("</file_contents>")[0].strip()
+                        code_sections.append("<file_contents>\n" + file_contents + "\n</file_contents>")
+                    
+                    if code_sections:
+                        self.code_viewer.insert("1.0", "\n\n".join(code_sections))
+                    else:
+                        self.code_viewer.insert("1.0", "No code content found")
+                    
+                    self.code_viewer.config(state=tk.DISABLED)
+            except Exception as e:
+                self.content_viewer.insert("1.0", f"Error loading content: {e}")
+                self.code_viewer.config(state=tk.NORMAL)
+                self.code_viewer.delete("1.0", tk.END)
+                self.code_viewer.insert("1.0", f"Error loading content: {e}")
+                self.code_viewer.config(state=tk.DISABLED)
+            self.content_viewer.config(state=tk.DISABLED)
+            
+            # Update instructions viewer
+            self.instructions_viewer.config(state=tk.NORMAL)
+            self.instructions_viewer.delete("1.0", tk.END)
+            try:
+                if os.path.exists(instructions_path):
+                    with open(instructions_path, 'r', encoding='utf-8') as f:
+                        instructions = f.read()
+                    self.instructions_viewer.insert("1.0", instructions)
+            except Exception as e:
+                self.instructions_viewer.insert("1.0", f"Error loading instructions: {e}")
+            self.instructions_viewer.config(state=tk.DISABLED)
+            
+            # Show status
+            self.set_status(f"Loaded: {self.selected_history_item['datetime']}")
+            
+    def on_copy_history_content(self):
+        """Copy the content of the selected history item to clipboard."""
+        if not self.selected_history_item:
+            self.set_status("Please select a history item first.")
+            return
+            
+        content_path = os.path.join(self.selected_history_item['path'], "content.txt")
+        if os.path.exists(content_path):
+            try:
+                with open(content_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                self.master.clipboard_clear()
+                self.master.clipboard_append(content)
+                self.set_status("History content copied to clipboard.")
+            except Exception as e:
+                self.set_status(f"Error: Could not load content: {e}", 5000)
+                
+    def on_copy_history_prompt(self):
+        """Copy just the user instructions from the selected history item."""
+        if not self.selected_history_item:
+            self.set_status("Please select a history item first.")
+            return
+            
+        instructions_path = os.path.join(self.selected_history_item['path'], "instructions.txt")
+        if os.path.exists(instructions_path):
+            try:
+                with open(instructions_path, 'r', encoding='utf-8') as f:
+                    instructions = f.read()
+                self.master.clipboard_clear()
+                self.master.clipboard_append(instructions)
+                self.set_status("User instructions copied to clipboard.")
+            except Exception as e:
+                self.set_status(f"Error: Could not load instructions: {e}", 5000)
+                
+    def on_delete_history_item(self):
+        """Delete the selected history item."""
+        if not self.selected_history_item:
+            self.set_status("Please select a history item first.")
+            return
+            
+        confirm_win = tk.Toplevel(self.master)
+        confirm_win.title("Confirm Delete")
+        confirm_win.geometry("300x120")
+        confirm_win.resizable(False, False)
+        
+        msg = f"Are you sure you want to delete this history item?\n\n{self.selected_history_item['datetime']}"
+        tk.Label(confirm_win, text=msg, wraplength=280).pack(padx=10, pady=10)
+        
+        btn_frame = tk.Frame(confirm_win)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+        
+        def do_delete():
+            try:
+                shutil.rmtree(self.selected_history_item['path'])
+                
+                # Remove from list
+                index = self.history_items.index(self.selected_history_item)
+                del self.history_items[index]
+                
+                # Update listbox
+                self.refresh_history_listbox()
+                
+                # Clear selection
+                self.selected_history_item = None
+                
+                # Clear viewers
+                self.content_viewer.config(state=tk.NORMAL)
+                self.content_viewer.delete("1.0", tk.END)
+                self.content_viewer.config(state=tk.DISABLED)
+                
+                self.instructions_viewer.config(state=tk.NORMAL)
+                self.instructions_viewer.delete("1.0", tk.END)
+                self.instructions_viewer.config(state=tk.DISABLED)
+                
+                confirm_win.destroy()
+                self.set_status("History item deleted successfully.")
+            except Exception as e:
+                confirm_win.destroy()
+                self.set_status(f"Error: Could not delete history item: {e}", 5000)
+        
+        btn_yes = tk.Button(btn_frame, text="Yes", command=do_delete, width=10)
+        btn_yes.pack(side=tk.LEFT, padx=5)
+        
+        btn_no = tk.Button(btn_frame, text="No", command=confirm_win.destroy, width=10)
+        btn_no.pack(side=tk.LEFT, padx=5)
+
+    def create_history_content_tabs(self, parent):
+        """Create the Content and Instructions tabs with proper styling from the start"""
+        self.history_notebook = ttk.Notebook(parent)
+        self.history_notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Create content tab with dark styling applied from the beginning
+        bg_color = self.current_theme.get("content_bg", self.current_theme["text_bg"])
+        fg_color = self.current_theme.get("content_fg", self.current_theme["text_fg"])
+        
+        # Content tab
+        content_frame = tk.Frame(self.history_notebook, bg=bg_color)
+        self.history_notebook.add(content_frame, text="Content")
+        
+        self.content_viewer = ScrolledText(content_frame, wrap=tk.WORD, height=6,
+                                          bg=bg_color, fg=fg_color)
+        self.content_viewer.pack(fill=tk.BOTH, expand=True)
+        self.content_viewer.config(state=tk.DISABLED)  # Read-only
+        
+        # Code and Tree tab 
+        code_frame = tk.Frame(self.history_notebook, bg=bg_color)
+        self.history_notebook.add(code_frame, text="Code & Tree")
+        
+        self.code_viewer = ScrolledText(code_frame, wrap=tk.WORD, height=6,
+                                        bg=bg_color, fg=fg_color)
+        self.code_viewer.pack(fill=tk.BOTH, expand=True)
+        self.code_viewer.config(state=tk.DISABLED)  # Read-only
+        
+        # Instructions tab
+        instructions_frame = tk.Frame(self.history_notebook, bg=bg_color)
+        self.history_notebook.add(instructions_frame, text="Instructions")
+        
+        self.instructions_viewer = ScrolledText(instructions_frame, wrap=tk.WORD, height=6,
+                                               bg=bg_color, fg=fg_color)
+        self.instructions_viewer.pack(fill=tk.BOTH, expand=True)
+        self.instructions_viewer.config(state=tk.DISABLED)  # Read-only
+
+def main():
+    root = tk.Tk()
+    app = FolderMonitorApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
