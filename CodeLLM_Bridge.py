@@ -7,10 +7,15 @@ from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 import datetime
 import shutil
+import threading
+from global_hotkeys import register_hotkey, start_checking_hotkeys, stop_checking_hotkeys
+import pyperclip
+import keyboard
 
 CONFIG_FILE = "app_settings.json"
 PROFILES_DIR = "profiles"
 HISTORY_DIR = "history"  # New directory for history
+DEFAULT_PREPEND_STRING = "Apply ALL these changes one by one -"  # Default string for prepending
 
 # Theme colors
 LIGHT_THEME = {
@@ -198,6 +203,12 @@ class FolderMonitorApp:
         # A set of directories we've already visited to avoid re-adding them
         self.visited_dirs = set()
 
+        # Initialize prepend string and hotkey variables
+        self.prepend_string = DEFAULT_PREPEND_STRING
+        self.prepend_hotkey_enabled = tk.BooleanVar(value=False)
+        self.hotkey_thread = None
+        self.hotkey_registered = False
+
         # First create widgets
         self.create_widgets()
         
@@ -222,6 +233,8 @@ class FolderMonitorApp:
         
         # Start polling
         self.schedule_folder_poll()
+
+        self.setup_global_hotkey()
 
     # -----------------------------------------------------------------------
     #  GUI
@@ -448,6 +461,28 @@ class FolderMonitorApp:
                                bg='#f0f0f0', fg='#333333',
                                height=2)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+        
+        # Add Prepend String UI
+        prepend_frame = tk.LabelFrame(self.master, text="Clipboard Prepend Hotkey (Ctrl+Alt+V)")
+        prepend_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        
+        # Create a frame for the entry and reset button
+        prepend_entry_frame = tk.Frame(prepend_frame)
+        prepend_entry_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
+        
+        self.prepend_entry = tk.Entry(prepend_entry_frame, width=60)
+        self.prepend_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.prepend_entry.insert(0, self.prepend_string)
+        self.prepend_entry.bind("<FocusOut>", self.on_prepend_string_changed)
+        
+        # Add reset button
+        btn_reset_prepend = tk.Button(prepend_entry_frame, text="Reset Default", command=self.reset_prepend_string)
+        btn_reset_prepend.pack(side=tk.LEFT, padx=5)
+        
+        self.prepend_hotkey_check = tk.Checkbutton(prepend_frame, text="Enable Ctrl+Alt+V Prepend Hotkey", 
+                                                  variable=self.prepend_hotkey_enabled, 
+                                                  command=self.on_toggle_prepend_hotkey)
+        self.prepend_hotkey_check.pack(side=tk.LEFT, padx=5)
         
     def on_dark_mode_toggle(self):
         """Handle dark mode toggle from checkbox"""
@@ -1393,7 +1428,9 @@ class FolderMonitorApp:
                         "ignore_patterns": self.ignore_patterns,
                         "copy_entire_tree": self.copy_entire_tree_var.get(),
                         "filter_system_folders": self.filter_system_folders.get(),
-                        "dark_mode": self.dark_mode.get()
+                        "dark_mode": self.dark_mode.get(),
+                        "prepend_string": self.prepend_string,
+                        "prepend_hotkey_enabled": self.prepend_hotkey_enabled.get(),
                     }
                     for path, info in self.folder_tree_data.items():
                         data["folder_checks"][path] = info['checked']
@@ -1453,6 +1490,8 @@ class FolderMonitorApp:
                 self.copy_entire_tree_var.set(data.get("copy_entire_tree", False))
                 self.filter_system_folders.set(data.get("filter_system_folders", True))
                 self.dark_mode.set(data.get("dark_mode", False))
+                self.prepend_string = data.get("prepend_string", DEFAULT_PREPEND_STRING)
+                self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
         
@@ -1474,6 +1513,13 @@ class FolderMonitorApp:
         
         # Load history for this profile
         self.load_history()
+
+        if hasattr(self, 'prepend_entry'):
+            self.prepend_entry.delete(0, tk.END)
+            self.prepend_entry.insert(0, self.prepend_string)
+        if hasattr(self, 'prepend_hotkey_check'):
+            self.prepend_hotkey_check.select() if self.prepend_hotkey_enabled.get() else self.prepend_hotkey_check.deselect()
+        self.setup_global_hotkey()
 
     def add_default_meta_prompts(self):
         """Add default meta prompts for new installations or empty profiles."""
@@ -1973,6 +2019,88 @@ class FolderMonitorApp:
                                                bg=bg_color, fg=fg_color)
         self.instructions_viewer.pack(fill=tk.BOTH, expand=True)
         self.instructions_viewer.config(state=tk.DISABLED)  # Read-only
+
+    def on_prepend_string_changed(self, event=None):
+        self.prepend_string = self.prepend_entry.get()
+        self.save_settings()
+
+    def on_toggle_prepend_hotkey(self):
+        if self.prepend_hotkey_enabled.get():
+            self.setup_global_hotkey()
+            self.set_status("Prepend hotkey enabled.")
+        else:
+            self.unregister_global_hotkey()
+            self.set_status("Prepend hotkey disabled.")
+        self.save_settings()
+
+    def setup_global_hotkey(self):
+        if self.prepend_hotkey_enabled.get() and not self.hotkey_registered:
+            def on_hotkey_press():
+                try:
+                    # Get clipboard content
+                    content = self.master.clipboard_get()
+                    
+                    # Check if content already starts with the prepend string
+                    if content.lstrip().startswith(self.prepend_string):
+                        # Content already has the prepend string, just simulate paste
+                        time.sleep(0.1)
+                        keyboard.release('ctrl')
+                        keyboard.release('alt')
+                        keyboard.release('v')
+                        time.sleep(0.1)
+                        keyboard.press('ctrl')
+                        keyboard.press('v')
+                        time.sleep(0.1)
+                        keyboard.release('v')
+                        keyboard.release('ctrl')
+                        return
+                    
+                    # Prepend string and two newlines
+                    new_content = f"{self.prepend_string}\n\n{content}"
+                    # Set clipboard
+                    self.master.clipboard_clear()
+                    self.master.clipboard_append(new_content)
+                    # Give a small delay to ensure clipboard is updated
+                    time.sleep(0.1)
+                    # Release the original hotkey combination to avoid interference
+                    keyboard.release('ctrl')
+                    keyboard.release('alt')
+                    keyboard.release('v')
+                    # Small delay before paste
+                    time.sleep(0.1)
+                    # Simulate paste using just Ctrl+V
+                    keyboard.press('ctrl')
+                    keyboard.press('v')
+                    time.sleep(0.1)
+                    keyboard.release('v')
+                    keyboard.release('ctrl')
+                except Exception as e:
+                    print(f"Hotkey error: {e}")
+            
+            def on_hotkey_release():
+                # We don't need to do anything on release
+                pass
+
+            # Register hotkey in a thread
+            def hotkey_thread_func():
+                register_hotkey("control + alt + v", on_hotkey_press, on_hotkey_release)
+                start_checking_hotkeys()
+            self.hotkey_thread = threading.Thread(target=hotkey_thread_func, daemon=True)
+            self.hotkey_thread.start()
+            self.hotkey_registered = True
+
+    def unregister_global_hotkey(self):
+        if self.hotkey_registered:
+            stop_checking_hotkeys()
+            self.hotkey_registered = False
+
+    def reset_prepend_string(self):
+        """Reset the prepend string to its default value."""
+        self.prepend_string = DEFAULT_PREPEND_STRING
+        self.prepend_entry.delete(0, tk.END)
+        self.prepend_entry.insert(0, self.prepend_string)
+        self.save_settings()
+        self.set_status("Prepend string reset to default.")
 
 def main():
     root = tk.Tk()
