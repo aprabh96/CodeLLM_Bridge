@@ -15,6 +15,7 @@ import keyboard
 CONFIG_FILE = "app_settings.json"
 PROFILES_DIR = "profiles"
 HISTORY_DIR = "history"  # New directory for history
+LAST_PROFILE_FILE = "last_profile.txt"  # File to store the last selected profile
 DEFAULT_PREPEND_STRING = "Apply ALL these changes one by one -"  # Default string for prepending
 
 # Theme colors
@@ -90,7 +91,7 @@ class FolderMonitorApp:
         self.current_theme = LIGHT_THEME
 
         # Profile management
-        self.current_profile = "default"
+        self.current_profile = self.load_last_profile()
         self.profiles = self.get_available_profiles()
         
         # History management
@@ -208,22 +209,38 @@ class FolderMonitorApp:
         self.prepend_hotkey_enabled = tk.BooleanVar(value=False)
         self.hotkey_thread = None
         self.hotkey_registered = False
+        # Default hotkey combination
+        self.hotkey_combination = "ctrl+alt+v"
 
         # First create widgets
         self.create_widgets()
         
-        # Then load settings and build tree
+        # Ensure the current profile exists in the profiles list
+        if self.current_profile not in self.profiles:
+            self.current_profile = "default"
+            self.save_last_profile("default")
+        
+        # Set the profile dropdown to the loaded profile
+        self.profile_var.set(self.current_profile)
+        
+        # Load settings first to get the correct dark mode setting
         self.load_settings()
         self.refresh_prompts_listbox()
         
-        # Update current theme based on settings
+        # NOW update current theme based on the loaded settings
         if self.dark_mode.get():
             self.current_theme = DARK_THEME
         else:
             self.current_theme = LIGHT_THEME
             
-        # Apply theme
+        # Apply theme after theme is correctly determined
         self.apply_theme()
+        
+        # Show which profile was loaded
+        if self.current_profile != "default":
+            self.set_status(f"Loaded last profile: {self.current_profile}")
+        else:
+            self.set_status("Ready")
         
         # Set some defaults for text widgets (will be overridden if needed)
         text_bg = self.current_theme["text_bg"]
@@ -235,6 +252,9 @@ class FolderMonitorApp:
         self.schedule_folder_poll()
 
         self.setup_global_hotkey()
+        
+        # Set up window close handler to save current state
+        self.master.protocol("WM_DELETE_WINDOW", self.on_window_close)
 
     # -----------------------------------------------------------------------
     #  GUI
@@ -463,26 +483,51 @@ class FolderMonitorApp:
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
         
         # Add Prepend String UI
-        prepend_frame = tk.LabelFrame(self.master, text="Clipboard Prepend Hotkey (Ctrl+Alt+V)")
+        prepend_frame = tk.LabelFrame(self.master, text="Clipboard Prepend Hotkey")
         prepend_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
         
-        # Create a frame for the entry and reset button
+        # Top row: prepend string entry and reset button
         prepend_entry_frame = tk.Frame(prepend_frame)
-        prepend_entry_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
+        prepend_entry_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
         
-        self.prepend_entry = tk.Entry(prepend_entry_frame, width=60)
-        self.prepend_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(prepend_entry_frame, text="Prepend Text:").pack(side=tk.LEFT, padx=5)
+        self.prepend_entry = tk.Entry(prepend_entry_frame, width=40)
+        self.prepend_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         self.prepend_entry.insert(0, self.prepend_string)
+        # Bind multiple events to ensure the prepend text is saved
         self.prepend_entry.bind("<FocusOut>", self.on_prepend_string_changed)
+        self.prepend_entry.bind("<Return>", self.on_prepend_string_changed)
+        self.prepend_entry.bind("<KeyRelease>", self.on_prepend_string_changed_delayed)
         
-        # Add reset button
+        btn_save_prepend = tk.Button(prepend_entry_frame, text="Save", command=self.on_save_prepend_text)
+        btn_save_prepend.pack(side=tk.LEFT, padx=2)
+        
         btn_reset_prepend = tk.Button(prepend_entry_frame, text="Reset Default", command=self.reset_prepend_string)
-        btn_reset_prepend.pack(side=tk.LEFT, padx=5)
+        btn_reset_prepend.pack(side=tk.LEFT, padx=2)
         
-        self.prepend_hotkey_check = tk.Checkbutton(prepend_frame, text="Enable Ctrl+Alt+V Prepend Hotkey", 
+        btn_debug_prepend = tk.Button(prepend_entry_frame, text="Debug", command=self.debug_prepend_settings)
+        btn_debug_prepend.pack(side=tk.LEFT, padx=2)
+        
+        # Bottom row: hotkey settings
+        hotkey_control_frame = tk.Frame(prepend_frame)
+        hotkey_control_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+        
+        self.prepend_hotkey_check = tk.Checkbutton(hotkey_control_frame, text="Enable Hotkey:", 
                                                   variable=self.prepend_hotkey_enabled, 
                                                   command=self.on_toggle_prepend_hotkey)
         self.prepend_hotkey_check.pack(side=tk.LEFT, padx=5)
+        
+        # Hotkey display and change button
+        self.hotkey_display = tk.Label(hotkey_control_frame, text=self.hotkey_combination.upper(), 
+                                      relief=tk.SUNKEN, padx=10, pady=2)
+        self.hotkey_display.pack(side=tk.LEFT, padx=5)
+        
+        btn_change_hotkey = tk.Button(hotkey_control_frame, text="Change Hotkey", command=self.on_change_hotkey)
+        btn_change_hotkey.pack(side=tk.LEFT, padx=5)
+        
+        # Hotkey status label
+        self.hotkey_status_label = tk.Label(hotkey_control_frame, text="", fg="green")
+        self.hotkey_status_label.pack(side=tk.LEFT, padx=10)
         
     def on_dark_mode_toggle(self):
         """Handle dark mode toggle from checkbox"""
@@ -697,6 +742,9 @@ class FolderMonitorApp:
                     
             elif widget_type == "Label":
                 widget.configure(bg=theme["bg"], fg=theme["fg"])
+                # Special handling for hotkey display label
+                if hasattr(self, 'hotkey_display') and widget == self.hotkey_display:
+                    widget.configure(bg=theme["button_bg"], fg=theme["button_fg"])
                 
             elif widget_type == "Button":
                 widget.configure(bg=theme["button_bg"], fg=theme["button_fg"],
@@ -1431,6 +1479,7 @@ class FolderMonitorApp:
                         "dark_mode": self.dark_mode.get(),
                         "prepend_string": self.prepend_string,
                         "prepend_hotkey_enabled": self.prepend_hotkey_enabled.get(),
+                        "hotkey_combination": self.hotkey_combination,
                     }
                     for path, info in self.folder_tree_data.items():
                         data["folder_checks"][path] = info['checked']
@@ -1492,6 +1541,7 @@ class FolderMonitorApp:
                 self.dark_mode.set(data.get("dark_mode", False))
                 self.prepend_string = data.get("prepend_string", DEFAULT_PREPEND_STRING)
                 self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
+                self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
         
@@ -1517,9 +1567,21 @@ class FolderMonitorApp:
         if hasattr(self, 'prepend_entry'):
             self.prepend_entry.delete(0, tk.END)
             self.prepend_entry.insert(0, self.prepend_string)
+            # Ensure the entry shows the full text by moving to the beginning
+            self.prepend_entry.icursor(0)
         if hasattr(self, 'prepend_hotkey_check'):
             self.prepend_hotkey_check.select() if self.prepend_hotkey_enabled.get() else self.prepend_hotkey_check.deselect()
-        self.setup_global_hotkey()
+        if hasattr(self, 'hotkey_display'):
+            self.hotkey_display.config(text=self.hotkey_combination.upper())
+        
+        # Update dark mode checkbox to reflect loaded setting
+        if hasattr(self, 'dark_mode_check'):
+            if self.dark_mode.get():
+                self.dark_mode_check.select()
+            else:
+                self.dark_mode_check.deselect()
+        
+        # Note: setup_global_hotkey() is called after theme is applied in __init__
 
     def add_default_meta_prompts(self):
         """Add default meta prompts for new installations or empty profiles."""
@@ -1542,6 +1604,28 @@ class FolderMonitorApp:
                 if f.endswith('.json'):
                     profiles.append(os.path.splitext(f)[0])
         return sorted(profiles)
+    
+    def load_last_profile(self):
+        """Load the last selected profile from file."""
+        try:
+            if os.path.exists(LAST_PROFILE_FILE):
+                with open(LAST_PROFILE_FILE, 'r', encoding='utf-8') as f:
+                    last_profile = f.read().strip()
+                    # Verify the profile still exists
+                    if last_profile == "default" or (os.path.exists(PROFILES_DIR) and 
+                        os.path.exists(os.path.join(PROFILES_DIR, f"{last_profile}.json"))):
+                        return last_profile
+        except Exception as e:
+            print(f"Error loading last profile: {e}")
+        return "default"
+    
+    def save_last_profile(self, profile_name):
+        """Save the currently selected profile as the last used profile."""
+        try:
+            with open(LAST_PROFILE_FILE, 'w', encoding='utf-8') as f:
+                f.write(profile_name)
+        except Exception as e:
+            print(f"Error saving last profile: {e}")
 
     def on_refresh_folders(self):
         """Refresh the folder tree while preserving selections."""
@@ -1593,6 +1677,9 @@ class FolderMonitorApp:
             self.profile_var.set(name)
             self.profiles.append(name)
             self.profile_combo['values'] = self.profiles
+            
+            # Save as last used profile
+            self.save_last_profile(name)
             
             # Clear the file list and user instructions for the new profile
             self.root_folders = []
@@ -1654,6 +1741,10 @@ class FolderMonitorApp:
             self.current_profile = "default"
             self.profile_var.set("default")
             self.profile_combo['values'] = self.profiles
+            
+            # Save default as last used profile
+            self.save_last_profile("default")
+            
             self.load_settings()
             
             confirm_win.destroy()
@@ -1675,6 +1766,9 @@ class FolderMonitorApp:
             # Switch to new profile
             self.current_profile = new_profile
             
+            # Save as last used profile
+            self.save_last_profile(new_profile)
+            
             # Clear all data structures completely
             self.folder_tree_data.clear()
             self.tree_ids_map.clear()
@@ -1692,6 +1786,8 @@ class FolderMonitorApp:
             
             # Clear history selection
             self.selected_history_item = None
+            
+            self.set_status(f"Switched to profile: {new_profile}")
 
     def save_profile(self, profile_name):
         """Save settings to a specific profile."""
@@ -1703,7 +1799,10 @@ class FolderMonitorApp:
             "ignore_patterns": self.ignore_patterns,
             "copy_entire_tree": self.copy_entire_tree_var.get(),
             "filter_system_folders": self.filter_system_folders.get(),
-            "dark_mode": self.dark_mode.get()
+            "dark_mode": self.dark_mode.get(),
+            "prepend_string": self.prepend_string,
+            "prepend_hotkey_enabled": self.prepend_hotkey_enabled.get(),
+            "hotkey_combination": self.hotkey_combination,
         }
         for path, info in self.folder_tree_data.items():
             data["folder_checks"][path] = info['checked']
@@ -2021,8 +2120,39 @@ class FolderMonitorApp:
         self.instructions_viewer.config(state=tk.DISABLED)  # Read-only
 
     def on_prepend_string_changed(self, event=None):
-        self.prepend_string = self.prepend_entry.get()
-        self.save_settings()
+        """Handle immediate prepend string changes."""
+        new_text = self.prepend_entry.get()
+        if new_text != self.prepend_string:
+            self.prepend_string = new_text
+            self.save_settings()
+            self.set_status(f"Prepend text saved: {self.prepend_string[:50]}{'...' if len(self.prepend_string) > 50 else ''}")
+    
+    def on_prepend_string_changed_delayed(self, event=None):
+        """Handle delayed prepend string changes to avoid too frequent saves."""
+        # Cancel any existing timer
+        if hasattr(self, '_prepend_save_timer'):
+            self.master.after_cancel(self._prepend_save_timer)
+        
+        # Set a new timer to save after 1 second of no typing
+        self._prepend_save_timer = self.master.after(1000, self._delayed_prepend_save)
+    
+    def _delayed_prepend_save(self):
+        """Actually save the prepend string after delay."""
+        new_text = self.prepend_entry.get()
+        if new_text != self.prepend_string:
+            self.prepend_string = new_text
+            self.save_settings()
+            self.set_status(f"Prepend text auto-saved: {self.prepend_string[:50]}{'...' if len(self.prepend_string) > 50 else ''}")
+    
+    def on_save_prepend_text(self):
+        """Manually save the prepend text."""
+        new_text = self.prepend_entry.get()
+        if new_text != self.prepend_string:
+            self.prepend_string = new_text
+            self.save_settings()
+            self.set_status(f"Prepend text manually saved: {self.prepend_string[:50]}{'...' if len(self.prepend_string) > 50 else ''}")
+        else:
+            self.set_status("Prepend text unchanged - no save needed.")
 
     def on_toggle_prepend_hotkey(self):
         if self.prepend_hotkey_enabled.get():
@@ -2034,7 +2164,12 @@ class FolderMonitorApp:
         self.save_settings()
 
     def setup_global_hotkey(self):
-        if self.prepend_hotkey_enabled.get() and not self.hotkey_registered:
+        """Setup or re-setup the global hotkey with improved error handling."""
+        # First unregister any existing hotkey
+        if self.hotkey_registered:
+            self.unregister_global_hotkey()
+            
+        if self.prepend_hotkey_enabled.get():
             def on_hotkey_press():
                 try:
                     # Get clipboard content
@@ -2044,9 +2179,9 @@ class FolderMonitorApp:
                     if content.lstrip().startswith(self.prepend_string):
                         # Content already has the prepend string, just simulate paste
                         time.sleep(0.1)
-                        keyboard.release('ctrl')
-                        keyboard.release('alt')
-                        keyboard.release('v')
+                        # Release all keys from the hotkey combination
+                        for key in self.hotkey_combination.split('+'):
+                            keyboard.release(key.strip())
                         time.sleep(0.1)
                         keyboard.press('ctrl')
                         keyboard.press('v')
@@ -2063,9 +2198,8 @@ class FolderMonitorApp:
                     # Give a small delay to ensure clipboard is updated
                     time.sleep(0.1)
                     # Release the original hotkey combination to avoid interference
-                    keyboard.release('ctrl')
-                    keyboard.release('alt')
-                    keyboard.release('v')
+                    for key in self.hotkey_combination.split('+'):
+                        keyboard.release(key.strip())
                     # Small delay before paste
                     time.sleep(0.1)
                     # Simulate paste using just Ctrl+V
@@ -2083,24 +2217,304 @@ class FolderMonitorApp:
 
             # Register hotkey in a thread
             def hotkey_thread_func():
-                register_hotkey("control + alt + v", on_hotkey_press, on_hotkey_release)
-                start_checking_hotkeys()
+                try:
+                    # Convert our format to the library's expected format
+                    hotkey_str = self.hotkey_combination.replace('ctrl', 'control').replace('+', ' + ')
+                    register_hotkey(hotkey_str, on_hotkey_press, on_hotkey_release)
+                    start_checking_hotkeys()
+                    self.hotkey_registered = True
+                    # Update status on main thread
+                    self.master.after(0, lambda: self.update_hotkey_status("Active", "green"))
+                except Exception as e:
+                    print(f"Hotkey registration error: {e}")
+                    self.hotkey_registered = False
+                    # Update status on main thread
+                    self.master.after(0, lambda: self.update_hotkey_status(f"Error: {str(e)}", "red"))
+                    
             self.hotkey_thread = threading.Thread(target=hotkey_thread_func, daemon=True)
             self.hotkey_thread.start()
-            self.hotkey_registered = True
+        else:
+            self.update_hotkey_status("", "")
 
     def unregister_global_hotkey(self):
+        """Unregister the global hotkey with proper cleanup."""
         if self.hotkey_registered:
-            stop_checking_hotkeys()
-            self.hotkey_registered = False
+            try:
+                stop_checking_hotkeys()
+                self.hotkey_registered = False
+                self.update_hotkey_status("", "")
+            except Exception as e:
+                print(f"Error unregistering hotkey: {e}")
+                self.hotkey_registered = False
+                
+    def update_hotkey_status(self, text, color):
+        """Update the hotkey status label."""
+        if hasattr(self, 'hotkey_status_label'):
+            # Handle empty color by using default theme color
+            if not color:
+                # Use current theme if available, otherwise use black as fallback
+                if hasattr(self, 'current_theme') and self.current_theme:
+                    color = self.current_theme.get("fg", "black")
+                else:
+                    color = "black"
+            self.hotkey_status_label.config(text=text, fg=color)
 
     def reset_prepend_string(self):
         """Reset the prepend string to its default value."""
-        self.prepend_string = DEFAULT_PREPEND_STRING
-        self.prepend_entry.delete(0, tk.END)
-        self.prepend_entry.insert(0, self.prepend_string)
-        self.save_settings()
-        self.set_status("Prepend string reset to default.")
+        # Confirm with user before resetting
+        import tkinter.messagebox as msgbox
+        result = msgbox.askyesno("Reset Prepend Text", 
+                                f"Reset prepend text to default?\n\nCurrent: {self.prepend_string[:50]}{'...' if len(self.prepend_string) > 50 else ''}\nDefault: {DEFAULT_PREPEND_STRING}")
+        if result:
+            self.prepend_string = DEFAULT_PREPEND_STRING
+            self.prepend_entry.delete(0, tk.END)
+            self.prepend_entry.insert(0, self.prepend_string)
+            self.prepend_entry.icursor(0)
+            self.save_settings()
+            self.set_status("Prepend string reset to default.")
+    
+    def debug_prepend_settings(self):
+        """Debug method to show current prepend settings."""
+        import tkinter.messagebox as msgbox
+        
+        # Check what's in memory
+        memory_text = f"In Memory: {self.prepend_string}"
+        
+        # Check what's in the entry widget
+        entry_text = f"In Entry: {self.prepend_entry.get()}"
+        
+        # Check what's in the settings file
+        file_text = "File: Not found"
+        try:
+            if self.current_profile == "default":
+                config_path = CONFIG_FILE
+            else:
+                config_path = os.path.join(PROFILES_DIR, f"{self.current_profile}.json")
+                
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                file_prepend = data.get("prepend_string", "NOT FOUND")
+                file_text = f"File: {file_prepend}"
+        except Exception as e:
+            file_text = f"File Error: {e}"
+        
+        debug_msg = f"Prepend String Debug:\n\n{memory_text}\n\n{entry_text}\n\n{file_text}\n\nProfile: {self.current_profile}"
+        msgbox.showinfo("Prepend Debug", debug_msg)
+        
+    def on_change_hotkey(self):
+        """Open a dialog to change the hotkey combination."""
+        change_win = tk.Toplevel(self.master)
+        change_win.title("Change Hotkey")
+        change_win.geometry("500x400")
+        change_win.resizable(False, False)
+        
+        # Center the window
+        change_win.transient(self.master)
+        change_win.grab_set()
+        
+        # Instructions
+        instruction_text = """Choose a new hotkey combination for the clipboard prepend function.
+
+Current hotkey: {}
+
+Click on the buttons below to select modifier keys, then select a main key.
+Common combinations like Ctrl+C, Ctrl+V, Ctrl+X are reserved and will be blocked.
+
+Recommended combinations:
+• Ctrl+Alt+V (default)
+• Ctrl+Shift+V
+• Ctrl+Alt+P
+• Ctrl+Shift+P
+• Win+V""".format(self.hotkey_combination.upper())
+        
+        instruction_label = tk.Label(change_win, text=instruction_text, justify=tk.LEFT, wraplength=480)
+        instruction_label.pack(padx=10, pady=10)
+        
+        # Current selection display
+        current_frame = tk.Frame(change_win)
+        current_frame.pack(pady=10)
+        
+        tk.Label(current_frame, text="New Hotkey: ", font=("Arial", 12, "bold")).pack(side=tk.LEFT)
+        hotkey_var = tk.StringVar(value=self.hotkey_combination)
+        hotkey_display_label = tk.Label(current_frame, textvariable=hotkey_var, 
+                                       font=("Arial", 12), bg="#e0e0e0", 
+                                       relief=tk.SUNKEN, padx=10, pady=5)
+        hotkey_display_label.pack(side=tk.LEFT, padx=10)
+        
+        # Modifier keys frame
+        mod_frame = tk.LabelFrame(change_win, text="Modifier Keys (choose at least one)")
+        mod_frame.pack(pady=10, padx=20, fill=tk.X)
+        
+        ctrl_var = tk.BooleanVar(value='ctrl' in self.hotkey_combination)
+        alt_var = tk.BooleanVar(value='alt' in self.hotkey_combination)
+        shift_var = tk.BooleanVar(value='shift' in self.hotkey_combination)
+        win_var = tk.BooleanVar(value='win' in self.hotkey_combination)
+        
+        def update_hotkey_display():
+            modifiers = []
+            if ctrl_var.get():
+                modifiers.append('ctrl')
+            if alt_var.get():
+                modifiers.append('alt')
+            if shift_var.get():
+                modifiers.append('shift')
+            if win_var.get():
+                modifiers.append('win')
+            
+            # Get current main key
+            current_keys = hotkey_var.get().split('+')
+            main_key = None
+            for key in current_keys:
+                if key.strip() not in ['ctrl', 'alt', 'shift', 'win']:
+                    main_key = key.strip()
+                    break
+            
+            if modifiers and main_key:
+                new_hotkey = '+'.join(modifiers) + '+' + main_key
+                hotkey_var.set(new_hotkey)
+            elif modifiers:
+                hotkey_var.set('+'.join(modifiers) + '+')
+            else:
+                hotkey_var.set('')
+        
+        tk.Checkbutton(mod_frame, text="Ctrl", variable=ctrl_var, command=update_hotkey_display).pack(side=tk.LEFT, padx=10)
+        tk.Checkbutton(mod_frame, text="Alt", variable=alt_var, command=update_hotkey_display).pack(side=tk.LEFT, padx=10)
+        tk.Checkbutton(mod_frame, text="Shift", variable=shift_var, command=update_hotkey_display).pack(side=tk.LEFT, padx=10)
+        tk.Checkbutton(mod_frame, text="Win", variable=win_var, command=update_hotkey_display).pack(side=tk.LEFT, padx=10)
+        
+        # Main key frame
+        key_frame = tk.LabelFrame(change_win, text="Main Key")
+        key_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        
+        # Common keys in a grid
+        keys = [
+            ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'],
+            ['I', 'J', 'K', 'L', 'M', 'N', 'O', 'P'],
+            ['Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X'],
+            ['Y', 'Z', '1', '2', '3', '4', '5', '6'],
+            ['7', '8', '9', '0', 'F1', 'F2', 'F3', 'F4'],
+            ['F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12']
+        ]
+        
+        def set_main_key(key):
+            modifiers = []
+            if ctrl_var.get():
+                modifiers.append('ctrl')
+            if alt_var.get():
+                modifiers.append('alt')
+            if shift_var.get():
+                modifiers.append('shift')
+            if win_var.get():
+                modifiers.append('win')
+            
+            if modifiers:
+                new_hotkey = '+'.join(modifiers) + '+' + key.lower()
+                hotkey_var.set(new_hotkey)
+        
+        for row in keys:
+            row_frame = tk.Frame(key_frame)
+            row_frame.pack(fill=tk.X, pady=2)
+            for key in row:
+                btn = tk.Button(row_frame, text=key, width=4, 
+                               command=lambda k=key: set_main_key(k))
+                btn.pack(side=tk.LEFT, padx=2)
+        
+        # Warning label for reserved combinations
+        warning_label = tk.Label(change_win, text="", fg="red", wraplength=480)
+        warning_label.pack(pady=5)
+        
+        def check_reserved_hotkey():
+            current_hotkey = hotkey_var.get().lower()
+            reserved_combinations = ['ctrl+c', 'ctrl+v', 'ctrl+x', 'ctrl+z', 'ctrl+y', 
+                                   'ctrl+a', 'ctrl+s', 'ctrl+n', 'ctrl+o', 'ctrl+p',
+                                   'alt+f4', 'alt+tab']
+            
+            if current_hotkey in reserved_combinations:
+                warning_label.config(text=f"⚠️ Warning: {current_hotkey.upper()} is a reserved system shortcut!")
+                return False
+            else:
+                warning_label.config(text="")
+                return True
+        
+        # Update warning when hotkey changes
+        def on_hotkey_change(*args):
+            check_reserved_hotkey()
+        hotkey_var.trace('w', on_hotkey_change)
+        
+        # Buttons frame
+        btn_frame = tk.Frame(change_win)
+        btn_frame.pack(pady=10)
+        
+        def apply_hotkey():
+            new_hotkey = hotkey_var.get()
+            if not new_hotkey or new_hotkey.endswith('+'):
+                messagebox.showwarning("Invalid Hotkey", "Please select both modifier keys and a main key.")
+                return
+            
+            if not check_reserved_hotkey():
+                result = messagebox.askyesno("Reserved Hotkey", 
+                    "This hotkey combination is normally reserved by the system. "
+                    "It may not work properly. Do you want to use it anyway?")
+                if not result:
+                    return
+            
+            # Test if modifiers are selected
+            modifiers = []
+            if ctrl_var.get():
+                modifiers.append('ctrl')
+            if alt_var.get():
+                modifiers.append('alt')
+            if shift_var.get():
+                modifiers.append('shift')
+            if win_var.get():
+                modifiers.append('win')
+            
+            if not modifiers:
+                messagebox.showwarning("Invalid Hotkey", "Please select at least one modifier key (Ctrl, Alt, Shift, or Win).")
+                return
+            
+            # Apply the new hotkey
+            old_hotkey = self.hotkey_combination
+            self.hotkey_combination = new_hotkey
+            self.hotkey_display.config(text=new_hotkey.upper())
+            
+            # Re-register hotkey if it's currently enabled
+            if self.prepend_hotkey_enabled.get():
+                self.setup_global_hotkey()
+            
+            self.save_settings()
+            change_win.destroy()
+            self.set_status(f"Hotkey changed from {old_hotkey.upper()} to {new_hotkey.upper()}")
+        
+        def cancel_change():
+            change_win.destroy()
+        
+        tk.Button(btn_frame, text="Apply", command=apply_hotkey, width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Cancel", command=cancel_change, width=10).pack(side=tk.LEFT, padx=5)
+        
+        # Focus the window
+        change_win.focus_set()
+
+    def on_window_close(self):
+        """Handle window close event to save current state and cleanup."""
+        try:
+            # Save current settings
+            self.save_settings()
+            
+            # Save current profile as last used
+            self.save_last_profile(self.current_profile)
+            
+            # Cleanup hotkeys
+            if self.hotkey_registered:
+                self.unregister_global_hotkey()
+                
+            # Destroy the window
+            self.master.destroy()
+        except Exception as e:
+            print(f"Error during window close: {e}")
+            # Force close even if there's an error
+            self.master.destroy()
 
 def main():
     root = tk.Tk()
