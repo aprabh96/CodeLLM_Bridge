@@ -2488,8 +2488,8 @@ class FolderMonitorApp:
         """Open a dialog to change the hotkey combination."""
         change_win = tk.Toplevel(self.master)
         change_win.title("Change Hotkey")
-        change_win.geometry("500x400")
-        change_win.resizable(False, False)
+        change_win.geometry("550x650")  # Increased from 500x550 to 550x650 for better visibility
+        change_win.resizable(True, True)  # Made resizable so users can adjust if needed
         
         # Center the window
         change_win.transient(self.master)
@@ -2565,9 +2565,9 @@ Recommended combinations:
         tk.Checkbutton(mod_frame, text="Shift", variable=shift_var, command=update_hotkey_display).pack(side=tk.LEFT, padx=10)
         tk.Checkbutton(mod_frame, text="Win", variable=win_var, command=update_hotkey_display).pack(side=tk.LEFT, padx=10)
         
-        # Main key frame
+        # Main key frame - limit expansion to leave room for buttons
         key_frame = tk.LabelFrame(change_win, text="Main Key")
-        key_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        key_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=False)  # Changed expand=False
         
         # Common keys in a grid
         keys = [
@@ -2624,9 +2624,9 @@ Recommended combinations:
             check_reserved_hotkey()
         hotkey_var.trace('w', on_hotkey_change)
         
-        # Buttons frame
+        # Buttons frame - ensure it's always visible at the bottom
         btn_frame = tk.Frame(change_win)
-        btn_frame.pack(pady=10)
+        btn_frame.pack(side=tk.BOTTOM, pady=15, fill=tk.X)  # Pack at bottom with more padding
         
         def apply_hotkey():
             new_hotkey = hotkey_var.get()
@@ -2672,8 +2672,14 @@ Recommended combinations:
         def cancel_change():
             change_win.destroy()
         
-        tk.Button(btn_frame, text="Apply", command=apply_hotkey, width=10).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Cancel", command=cancel_change, width=10).pack(side=tk.LEFT, padx=5)
+        # Create buttons with better visibility - centered in the frame
+        button_container = tk.Frame(btn_frame)
+        button_container.pack()
+        
+        tk.Button(button_container, text="Save", command=apply_hotkey, width=10, 
+                 font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=10)
+        tk.Button(button_container, text="Cancel", command=cancel_change, width=10, 
+                 font=("Arial", 10)).pack(side=tk.LEFT, padx=10)
         
         # Focus the window
         change_win.focus_set()
