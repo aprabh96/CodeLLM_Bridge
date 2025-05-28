@@ -56,6 +56,10 @@ The default prompt encourages AI models to provide clear instructions about whic
   - Provides a complete overview of your project organization
   - Helps AI models understand the context and relationships between files
   - Useful when you want to show the complete project structure without copying all file contents
+- **Temporary File Export**: Save content to a temporary file and copy the file to clipboard
+  - Ideal for large codebases that exceed AI input field character limits
+  - Creates timestamped temporary files that can be uploaded to AI tools
+  - Automatically copies the file to clipboard for easy pasting into applications
 
 ## Output Format
 
@@ -99,7 +103,9 @@ This standardized format helps AI models understand your codebase structure and 
 3. **Add Instructions**: Enter specific instructions for the AI in the "User Instructions" section
 4. **Add Meta Prompts**: Create reusable prompts for common tasks
 5. **Copy to Clipboard**: Click "Copy to Clipboard" to format everything for the AI
-6. **Paste into AI Tool**: Paste the copied content into your AI tool of choice
+   - **Alternative**: Click "Save to Temp File & Copy" to save the content to a temporary file and copy the file to clipboard
+   - This is useful for large codebases that exceed AI input field limits - you can paste the file directly into applications
+6. **Paste into AI Tool**: Paste the copied content or file into your AI tool of choice
 7. **Implement Changes**: When you receive the AI's response, use tools like Cursor.ai or Windsurf to implement the changes
 
 ## Workflow

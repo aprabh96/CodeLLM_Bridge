@@ -11,6 +11,7 @@ import threading
 from global_hotkeys import register_hotkey, start_checking_hotkeys, stop_checking_hotkeys
 import pyperclip
 import keyboard
+import tempfile
 
 CONFIG_FILE = "app_settings.json"
 PROFILES_DIR = "profiles"
@@ -328,7 +329,14 @@ class FolderMonitorApp:
         btn_add_prompt = tk.Button(top_frame, text="Add New Meta Prompt", command=self.on_add_prompt)
         btn_add_prompt.pack(side=tk.LEFT, padx=5)
 
-        # Copy
+        # Show Selected Files button
+        self.btn_show_selected = tk.Button(top_frame, text="Show All Selected Files", command=self.on_show_selected_files)
+        self.btn_show_selected.pack(side=tk.LEFT, padx=5)
+
+        # Copy buttons
+        btn_copy_file = tk.Button(top_frame, text="Save to Temp File & Copy", command=self.on_copy_to_temp_file)
+        btn_copy_file.pack(side=tk.RIGHT, padx=2)
+        
         btn_copy = tk.Button(top_frame, text="Copy to Clipboard", command=self.on_copy_to_clipboard)
         btn_copy.pack(side=tk.RIGHT, padx=5)
 
@@ -940,7 +948,7 @@ class FolderMonitorApp:
         self.tree_ids_map[folder] = root_id
 
         self.add_directory_contents(folder, root_id)
-        self.tree.item(root_id, open=True)
+        # Don't automatically open root folders - let expand_to_show_selected handle this
 
     def add_directory_contents(self, directory_path, parent_id):
         try:
@@ -994,6 +1002,10 @@ class FolderMonitorApp:
         
         # Clear saved checks after applying
         self.saved_folder_checks = {}
+        
+        # Update button count and automatically expand tree to show selected items
+        self.update_show_selected_button()
+        self.master.after(100, self.expand_to_show_selected)  # Small delay to ensure tree is fully built
 
     # -----------------------------------------------------------------------
     #  IGNORE PATTERNS
@@ -1130,12 +1142,94 @@ class FolderMonitorApp:
             for p in list(self.folder_tree_data.keys()):
                 if os.path.dirname(p) == path:
                     self.set_subtree_checked(p, checked)
+        
+        # Update the show selected button count
+        self.update_show_selected_button()
 
     def find_path_by_tree_id(self, tree_id):
         for p, tid in self.tree_ids_map.items():
             if tid == tree_id:
                 return p
         return None
+
+    def on_show_selected_files(self):
+        """Expand the tree to show all selected files and folders."""
+        self._manual_expand_call = True
+        self.expand_to_show_selected()
+        
+    def expand_to_show_selected(self):
+        """Expand tree nodes to make all selected items visible."""
+        selected_paths = [path for path, info in self.folder_tree_data.items() if info['checked']]
+        
+        if not selected_paths:
+            # Only show this message if called manually (not during auto-expansion)
+            if hasattr(self, '_manual_expand_call'):
+                self.set_status("No files are currently selected.")
+                delattr(self, '_manual_expand_call')
+            return
+        
+        # Collect all parent directories that need to be expanded
+        paths_to_expand = set()
+        
+        for selected_path in selected_paths:
+            # Add the selected path itself if it's a directory
+            if self.folder_tree_data[selected_path]['is_dir']:
+                paths_to_expand.add(selected_path)
+            
+            # Add all parent directories of this selected path
+            current_path = selected_path
+            while current_path:
+                parent_path = os.path.dirname(current_path)
+                if parent_path and parent_path != current_path and parent_path in self.folder_tree_data:
+                    paths_to_expand.add(parent_path)
+                    current_path = parent_path
+                else:
+                    break
+        
+        # Also add the root folders themselves
+        for root_folder in self.root_folders:
+            if root_folder in self.folder_tree_data:
+                paths_to_expand.add(root_folder)
+        
+        # Expand all necessary nodes
+        expanded_count = 0
+        for path in sorted(paths_to_expand):  # Sort to expand from root to leaves
+            if path in self.tree_ids_map:
+                tree_id = self.tree_ids_map[path]
+                if self.tree.exists(tree_id):
+                    # Check if it's currently collapsed
+                    if not self.tree.item(tree_id, 'open'):
+                        self.tree.item(tree_id, open=True)
+                        expanded_count += 1
+        
+        # Scroll to the first selected item to make it visible
+        if selected_paths:
+            # Sort selected paths to find the "first" one (alphabetically)
+            first_selected = sorted(selected_paths)[0]
+            if first_selected in self.tree_ids_map:
+                tree_id = self.tree_ids_map[first_selected]
+                if self.tree.exists(tree_id):
+                    self.tree.see(tree_id)
+                    # Also select it to highlight it
+                    self.tree.selection_set(tree_id)
+        
+        selected_count = len(selected_paths)
+        # Only show status message if called manually
+        if hasattr(self, '_manual_expand_call'):
+            self.set_status(f"Expanded tree to show {selected_count} selected items (expanded {expanded_count} folders).")
+            delattr(self, '_manual_expand_call')
+        
+        # Update the button text to show count
+        self.update_show_selected_button()
+
+    def update_show_selected_button(self):
+        """Update the 'Show All Selected Files' button text to show count."""
+        if hasattr(self, 'btn_show_selected'):
+            selected_count = len([path for path, info in self.folder_tree_data.items() if info['checked']])
+            if selected_count > 0:
+                self.btn_show_selected.config(text=f"Show All Selected Files ({selected_count})")
+            else:
+                self.btn_show_selected.config(text="Show All Selected Files")
 
     # -----------------------------------------------------------------------
     #  META PROMPTS
@@ -1293,6 +1387,88 @@ class FolderMonitorApp:
         self.master.clipboard_clear()
         self.master.clipboard_append(final_clip)
         self.save_settings()
+
+    def on_copy_to_temp_file(self):
+        """Save content to a temporary file and copy the file path to clipboard."""
+        self.user_instructions = self.instructions_text.get("1.0", tk.END).strip()
+        
+        # Verify that checked items still exist and are accessible
+        self.validate_checked_items()
+        
+        if self.copy_entire_tree_var.get():
+            file_tree_block = self.build_full_file_tree_text()
+        else:
+            file_tree_block = self.build_checked_file_tree_text()
+
+        file_contents_block = self.build_file_contents_text()
+        meta_prompts_block = self.build_meta_prompts_text()
+        user_instructions_block = f"<user_instructions>\n{self.user_instructions}\n</user_instructions>"
+
+        final_content = (
+            f"<file_tree>\n{file_tree_block}\n</file_tree>\n\n"
+            f"<file_contents>\n{file_contents_block}\n</file_contents>\n\n"
+            f"{meta_prompts_block}\n"
+            f"{user_instructions_block}\n"
+        )
+
+        try:
+            # Create a temporary file with a descriptive name
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_file = tempfile.NamedTemporaryFile(
+                mode='w', 
+                encoding='utf-8', 
+                suffix=f'_codellm_bridge_{timestamp}.txt',
+                delete=False  # Don't delete automatically so LLMs can read it
+            )
+            
+            # Write the content to the temporary file
+            temp_file.write(final_content)
+            temp_file.close()
+            
+            # Copy the actual file to clipboard (like right-click copy in Windows Explorer)
+            import subprocess
+            import os
+            
+            # Use Windows PowerShell to copy the file to clipboard
+            try:
+                # Convert path to Windows format if needed
+                windows_path = temp_file.name.replace('/', '\\')
+                
+                # PowerShell command to copy file to clipboard
+                ps_command = f'Set-Clipboard -Path "{windows_path}"'
+                subprocess.run(['powershell', '-Command', ps_command], 
+                             check=True, capture_output=True, text=True)
+                
+            except subprocess.CalledProcessError as e:
+                # Fallback: copy file path as text if PowerShell method fails
+                self.master.clipboard_clear()
+                self.master.clipboard_append(temp_file.name)
+            
+            # Check if this content is identical to the most recent history item
+            is_duplicate = False
+            if self.history_items:
+                latest_history_path = os.path.join(self.history_items[0]['path'], "content.txt")
+                try:
+                    if os.path.exists(latest_history_path):
+                        with open(latest_history_path, 'r', encoding='utf-8') as f:
+                            last_content = f.read()
+                        if last_content == final_content:
+                            is_duplicate = True
+                except Exception:
+                    # If there's any error reading the file, assume it's not a duplicate
+                    pass
+
+            # Only save to history if it's not a duplicate
+            if not is_duplicate:
+                self.save_history_item(final_content, self.user_instructions)
+                self.set_status(f"Content saved to temporary file: {temp_file.name}\nFile copied to clipboard and saved to history.")
+            else:
+                self.set_status(f"Content saved to temporary file: {temp_file.name}\nFile copied to clipboard (duplicate not saved to history).")
+            
+            self.save_settings()
+            
+        except Exception as e:
+            self.set_status(f"Error creating temporary file: {str(e)}")
         
     def validate_checked_items(self):
         """
@@ -1658,6 +1834,9 @@ class FolderMonitorApp:
         
         # Validate checked items to ensure consistency
         self.validate_checked_items()
+        
+        # Expand tree to show selected items
+        self.master.after(100, self.expand_to_show_selected)
 
     def on_new_profile(self):
         """Create a new profile."""
@@ -1786,6 +1965,9 @@ class FolderMonitorApp:
             
             # Clear history selection
             self.selected_history_item = None
+            
+            # Expand tree to show selected items after a short delay
+            self.master.after(200, self.expand_to_show_selected)
             
             self.set_status(f"Switched to profile: {new_profile}")
 
