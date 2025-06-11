@@ -3275,6 +3275,7 @@ class FolderMonitorApp:
             "prepend_string": self.prepend_string,
             "prepend_hotkey_enabled": self.prepend_hotkey_enabled.get(),
             "hotkey_combination": self.hotkey_combination,
+            "enable_timeouts": self.enable_timeouts.get(),
         }
         for path, info in self.folder_tree_data.items():
             data["folder_checks"][path] = info['checked']

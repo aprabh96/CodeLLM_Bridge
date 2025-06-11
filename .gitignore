@@ -1,5 +1,6 @@
 # Configuration files
 app_settings.json
+last_profile.txt
 
 # Profile data
 profiles/
