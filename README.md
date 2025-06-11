@@ -38,6 +38,82 @@ CodeLLM Bridge comes with a default meta prompt that instructs AI models to prov
 
 The default prompt encourages AI models to provide clear instructions about which files to modify, where changes should be made, and how the code should be formatted - all within the chat interface for easy copying.
 
+## Timeout and Network Folder Handling
+
+**New in this version**: CodeLLM Bridge now includes robust timeout and fallback mechanisms to handle FTP servers and network folders that may be slow or unresponsive.
+
+### Features
+
+- **Dynamic Loading Dialog**: A real-time progress dialog shows exactly what's happening during startup, including which folders are being processed
+- **Interactive Progress**: See live updates of folder scanning with the ability to skip or cancel loading at any time
+- **Smart Skip/Cancel Options**: Two user-controlled options:
+  - **"Skip This Profile"**: Skip to a working fallback profile
+  - **"Cancel & Use Default"**: Go directly to the default profile
+- **Automatic Timeout Detection**: If folders (especially FTP/network paths) take too long to load, the app will timeout instead of hanging indefinitely
+- **Intelligent Fallback**: When the last-used profile can't load due to timeouts, the app automatically switches to a working fallback profile
+- **Visual Indicators**: Problematic network folders are marked with ⚠️ warning indicators in the folder tree
+- **Retry Functionality**: A "🔄 Retry Original Profile" button appears when using a fallback, allowing you to retry your original profile when network conditions improve
+- **Configurable Timeouts**: Timeout values can be adjusted in the source code if needed
+
+### How It Works
+
+1. **Interactive Loading Dialog**: When starting the app, a progress dialog immediately appears showing:
+   - Which profile is being loaded
+   - Current operation (e.g., "Reading profile configuration...", "Building folder tree...")
+   - Specific folder/file being processed (e.g., "Scanning: C:\\MyProject\\src")
+   - Progress indicator with "Processing folder X of Y"
+   - Real-time status updates and error messages
+
+2. **User Control During Loading**: While the dialog is open, you can:
+   - **Monitor Progress**: See exactly what folder is being scanned
+   - **Skip Profile**: Click to skip the current profile and load a working fallback
+   - **Cancel to Default**: Click to cancel everything and use the default profile
+   - **Wait for Completion**: Let it finish loading (with automatic timeout protection)
+
+3. **Startup Protection**: When starting the app, if your last-used profile contains FTP or network folders that are unresponsive, the app will:
+   - Show real-time progress of loading attempts
+   - Try to load for up to 10 seconds (configurable) per operation
+   - If timeout occurs, automatically switch to a working fallback profile
+   - Show a warning message and retry button
+
+4. **Folder Access Protection**: When building folder trees, each network/FTP folder is:
+   - Tested for accessibility with a 3-second timeout (configurable)
+   - Progress is shown in real-time ("Checking access: ftp://server/path")
+   - Marked with ⚠️ if problematic
+   - Skipped if completely inaccessible
+
+5. **Smart Path Detection**: The app automatically detects potentially problematic paths:
+   - FTP URLs (ftp://, sftp://, ftps://)
+   - Network shares (\\\\server\\share)
+   - Very long paths (>200 characters)
+   - Non-existent local paths
+
+### Configuration
+
+You can adjust timeout values by editing these constants in `CodeLLM_Bridge.py`:
+
+```python
+# Timeout settings for folder loading (configurable)
+FOLDER_LOADING_TIMEOUT = 10  # seconds - total time to load a profile
+FOLDER_ACCESS_TIMEOUT = 3    # seconds per folder access check
+
+# You can adjust these values:
+# - Increase FOLDER_LOADING_TIMEOUT if you have very large projects
+# - Increase FOLDER_ACCESS_TIMEOUT if you have slow network connections
+# - Decrease them if you want faster fallback for unresponsive servers
+```
+
+### Troubleshooting FTP Issues
+
+If you're working with FTP servers:
+
+1. **Connection Issues**: If you see timeout warnings, check your network connection and FTP server availability
+2. **Slow Servers**: Increase the timeout values if your FTP server is slow but functional
+3. **Authentication**: Ensure your FTP paths are accessible without additional authentication prompts
+4. **Retry**: Use the "🔄 Retry Original Profile" button once network issues are resolved
+
+This enhancement ensures CodeLLM Bridge starts reliably even when network folders are unresponsive, preventing the frustrating hang-on-startup issue.
+
 ## Features
 
 - **File Tree Selection**: Choose specific files and directories to share with the AI

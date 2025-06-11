@@ -12,6 +12,141 @@ from global_hotkeys import register_hotkey, start_checking_hotkeys, stop_checkin
 import pyperclip
 import keyboard
 import tempfile
+import signal
+import queue
+
+class LoadingDialog:
+    """A dialog that shows loading progress with the ability to cancel."""
+    
+    def __init__(self, parent, title="Loading Profile"):
+        self.parent = parent
+        self.cancelled = False
+        self.current_operation = ""
+        
+        # Create the dialog window
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title(title)
+        self.dialog.geometry("500x200")
+        self.dialog.resizable(False, False)
+        
+        # Center the dialog on parent
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        # Create the UI
+        self.setup_ui()
+        
+        # Make dialog modal
+        self.dialog.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        
+    def setup_ui(self):
+        """Set up the loading dialog UI."""
+        main_frame = tk.Frame(self.dialog, padx=20, pady=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Title
+        title_label = tk.Label(main_frame, text="Loading Profile...", 
+                              font=("Arial", 14, "bold"))
+        title_label.pack(pady=(0, 10))
+        
+        # Progress bar
+        self.progress = ttk.Progressbar(main_frame, mode='indeterminate', length=400)
+        self.progress.pack(pady=(0, 10))
+        self.progress.start(10)  # Start animation
+        
+        # Current operation label
+        self.operation_label = tk.Label(main_frame, text="Initializing...", 
+                                       wraplength=450, justify=tk.LEFT)
+        self.operation_label.pack(pady=(0, 10))
+        
+        # Current folder/file label
+        self.detail_label = tk.Label(main_frame, text="", 
+                                    wraplength=450, justify=tk.LEFT,
+                                    font=("Arial", 9), fg="gray")
+        self.detail_label.pack(pady=(0, 15))
+        
+        # Buttons frame
+        button_frame = tk.Frame(main_frame)
+        button_frame.pack(fill=tk.X)
+        
+        # Skip button
+        self.skip_button = tk.Button(button_frame, text="Skip This Profile", 
+                                    command=self.on_skip,
+                                    bg="#ff9800", fg="white")
+        self.skip_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Cancel button
+        self.cancel_button = tk.Button(button_frame, text="Cancel & Use Default", 
+                                      command=self.on_cancel,
+                                      bg="#f44336", fg="white")
+        self.cancel_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Disable timeouts button
+        self.disable_timeout_button = tk.Button(button_frame, text="Disable Timeouts", 
+                                               command=self.on_disable_timeouts,
+                                               bg="#2196f3", fg="white")
+        self.disable_timeout_button.pack(side=tk.LEFT)
+        
+        # Status label
+        self.status_label = tk.Label(main_frame, text="", fg="red", font=("Arial", 8))
+        self.status_label.pack(pady=(10, 0))
+        
+    def update_operation(self, operation_text):
+        """Update the main operation text."""
+        self.current_operation = operation_text
+        if hasattr(self, 'operation_label'):
+            self.operation_label.config(text=operation_text)
+            self.dialog.update()
+            
+    def update_detail(self, detail_text):
+        """Update the detailed progress text."""
+        if hasattr(self, 'detail_label'):
+            # Truncate very long paths
+            if len(detail_text) > 60:
+                detail_text = "..." + detail_text[-57:]
+            self.detail_label.config(text=detail_text)
+            self.dialog.update()
+            
+    def update_status(self, status_text, color="red"):
+        """Update the status message."""
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text=status_text, fg=color)
+            self.dialog.update()
+            
+    def on_skip(self):
+        """Handle skip button click."""
+        self.cancelled = "skip"
+        self.update_status("Skipping current profile...", "orange")
+        
+    def on_cancel(self):
+        """Handle cancel button click."""
+        self.cancelled = "cancel"
+        self.update_status("Cancelling and using default profile...", "red")
+        
+    def on_disable_timeouts(self):
+        """Handle disable timeouts button click."""
+        self.cancelled = "disable_timeouts"
+        self.update_status("Timeouts disabled - loading will continue without time limits...", "blue")
+        # Hide the disable timeouts button and update the other buttons
+        self.disable_timeout_button.pack_forget()
+        self.skip_button.config(text="Continue in Background")
+        self.cancel_button.config(text="Cancel & Use Default")
+        
+    def is_cancelled(self):
+        """Check if operation was cancelled."""
+        return self.cancelled != False
+        
+    def get_cancel_type(self):
+        """Get the type of cancellation (skip, cancel, or disable_timeouts)."""
+        return self.cancelled
+        
+    def close(self):
+        """Close the dialog."""
+        if hasattr(self, 'progress'):
+            self.progress.stop()
+        if hasattr(self, 'dialog'):
+            self.dialog.grab_release()
+            self.dialog.destroy()
 
 CONFIG_FILE = "app_settings.json"
 PROFILES_DIR = "profiles"
@@ -58,6 +193,42 @@ DARK_THEME = {
     "content_fg": "#e0e0e0"   # Bright text for contrast
 }
 
+# Timeout settings for folder loading (configurable)
+FOLDER_LOADING_TIMEOUT = 10  # seconds - total time to load a profile
+FOLDER_ACCESS_TIMEOUT = 3    # seconds per folder access check
+
+# You can adjust these values:
+# - Increase FOLDER_LOADING_TIMEOUT if you have very large projects
+# - Increase FOLDER_ACCESS_TIMEOUT if you have slow network connections
+# - Decrease them if you want faster fallback for unresponsive servers
+
+class TimeoutError(Exception):
+    """Custom timeout exception"""
+    pass
+
+class FolderLoadingTimeout:
+    """Context manager for handling folder loading timeouts"""
+    def __init__(self, timeout_seconds):
+        self.timeout_seconds = timeout_seconds
+        self.old_handler = None
+        
+    def __enter__(self):
+        # For Unix-like systems, use signal
+        if os.name != 'nt':
+            self.old_handler = signal.signal(signal.SIGALRM, self._timeout_handler)
+            signal.alarm(self.timeout_seconds)
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Cancel the alarm and restore old handler (Unix only)
+        if os.name != 'nt':
+            signal.alarm(0)
+            if self.old_handler is not None:
+                signal.signal(signal.SIGALRM, self.old_handler)
+            
+    def _timeout_handler(self, signum, frame):
+        raise TimeoutError(f"Folder loading timed out after {self.timeout_seconds} seconds")
+
 def read_file_with_fallback(path):
     """
     Try reading a file with UTF-8, then fallback to CP-1252,
@@ -92,8 +263,14 @@ class FolderMonitorApp:
         self.current_theme = LIGHT_THEME
 
         # Profile management
-        self.current_profile = self.load_last_profile()
+        self.current_profile = self.load_last_profile_with_fallback()
         self.profiles = self.get_available_profiles()
+        
+        # Flag to track if we're loading with a fallback profile
+        self.is_fallback_profile = False
+        
+        # Loading dialog reference
+        self.loading_dialog = None
         
         # History management
         self.history_items = []  # List to store history items
@@ -212,6 +389,9 @@ class FolderMonitorApp:
         self.hotkey_registered = False
         # Default hotkey combination
         self.hotkey_combination = "ctrl+alt+v"
+        
+        # Timeout control
+        self.enable_timeouts = tk.BooleanVar(value=True)  # Default: timeouts enabled
 
         # First create widgets
         self.create_widgets()
@@ -224,8 +404,8 @@ class FolderMonitorApp:
         # Set the profile dropdown to the loaded profile
         self.profile_var.set(self.current_profile)
         
-        # Load settings first to get the correct dark mode setting
-        self.load_settings()
+        # Load settings with timeout handling
+        self.load_settings_with_timeout()
         self.refresh_prompts_listbox()
         
         # NOW update current theme based on the loaded settings
@@ -237,9 +417,13 @@ class FolderMonitorApp:
         # Apply theme after theme is correctly determined
         self.apply_theme()
         
-        # Show which profile was loaded
-        if self.current_profile != "default":
-            self.set_status(f"Loaded last profile: {self.current_profile}")
+        # Show status based on whether we loaded successfully or used fallback
+        if self.is_fallback_profile:
+            self.set_status(f"⚠️ Failed to load '{self.current_profile}' due to timeout - using fallback profile. Check network connections for FTP folders.", 10000)
+            # Show the retry button
+            self.btn_retry_profile.pack(side=tk.RIGHT, padx=5)
+        elif self.current_profile != "default":
+            self.set_status(f"Loaded profile: {self.current_profile}")
         else:
             self.set_status("Ready")
         
@@ -305,6 +489,15 @@ class FolderMonitorApp:
             command=self.on_toggle_system_filter
         )
         chk_system_filter.pack(side=tk.LEFT, padx=5)
+        
+        # Timeout Control Checkbox
+        chk_timeout_control = tk.Checkbutton(
+            refresh_frame, 
+            text="Enable timeouts (uncheck to wait indefinitely)",
+            variable=self.enable_timeouts,
+            command=self.on_toggle_timeout_control
+        )
+        chk_timeout_control.pack(side=tk.LEFT, padx=5)
 
         top_frame = tk.Frame(main_container)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
@@ -339,6 +532,12 @@ class FolderMonitorApp:
         
         btn_copy = tk.Button(top_frame, text="Copy to Clipboard", command=self.on_copy_to_clipboard)
         btn_copy.pack(side=tk.RIGHT, padx=5)
+
+        # Add retry button for failed profile loads (initially hidden)
+        self.btn_retry_profile = tk.Button(top_frame, text="🔄 Retry Original Profile", 
+                                          command=self.on_retry_original_profile,
+                                          bg="#ffeb3b", fg="#000000")
+        # Don't pack it initially - we'll show it only when needed
 
         # MAIN area
         main_frame = tk.Frame(main_container)
@@ -929,31 +1128,167 @@ class FolderMonitorApp:
 
         # apply saved checks
         self.apply_saved_checks()
+    
+    def build_all_trees_with_dialog_threaded(self, cancel_flag):
+        """
+        Build trees with progress updates to the loading dialog, designed for threading.
+        """
+        def update_dialog_safe(operation_text, detail_text=None):
+            """Safely update dialog from thread."""
+            try:
+                if self.loading_dialog:
+                    self.master.after_idle(lambda: self.loading_dialog.update_operation(operation_text))
+                    if detail_text:
+                        self.master.after_idle(lambda: self.loading_dialog.update_detail(detail_text))
+            except:
+                pass
+        
+        # Clear data structures from main thread
+        def clear_data():
+            self.folder_tree_data.clear()
+            self.tree_ids_map.clear()
+            self.tree.delete(*self.tree.get_children())
+            self.visited_dirs = set()
+        self.master.after_idle(clear_data)
+        
+        # Wait for clearing to complete
+        time.sleep(0.1)
+
+        total_folders = len(self.root_folders)
+        
+        for i, folder in enumerate(self.root_folders):
+            # Check if user cancelled
+            if cancel_flag.is_set():
+                return
+                
+            update_dialog_safe(f"Processing folder {i+1} of {total_folders}...", folder)
+            
+            if not os.path.exists(folder):
+                continue
+                
+            self.build_tree_for_with_dialog_threaded(folder, cancel_flag)
+            
+            # Check for cancellation after each folder
+            if cancel_flag.is_set():
+                return
+
+        # apply saved checks
+        update_dialog_safe("Restoring selections...")
+        self.master.after_idle(self.apply_saved_checks)
+
+    def build_all_trees_with_dialog(self):
+        """
+        Build trees with progress updates to the loading dialog.
+        """
+        self.folder_tree_data.clear()
+        self.tree_ids_map.clear()
+        self.tree.delete(*self.tree.get_children())
+        self.visited_dirs = set()
+
+        total_folders = len(self.root_folders)
+        
+        for i, folder in enumerate(self.root_folders):
+            # Check if user cancelled
+            if self.loading_dialog and self.loading_dialog.is_cancelled():
+                break
+                
+            if self.loading_dialog:
+                self.loading_dialog.update_operation(f"Processing folder {i+1} of {total_folders}...")
+                self.loading_dialog.update_detail(folder)
+            
+            if not os.path.exists(folder):
+                continue
+                
+            self.build_tree_for_with_dialog(folder)
+
+        # apply saved checks
+        if self.loading_dialog:
+            self.loading_dialog.update_operation("Restoring selections...")
+        self.apply_saved_checks()
 
     def build_tree_for(self, folder):
         """
         Recursively add 'folder' and all its sub-items to the TreeView,
         skipping directories we've visited or that match ignore patterns.
+        Now with timeout handling for network/FTP folders.
         """
-        realp = os.path.realpath(folder)
-        if realp in self.visited_dirs:
-            return
-        self.visited_dirs.add(realp)
+        try:
+            # Check if folder exists with a timeout
+            if not self.check_folder_access_with_timeout(folder):
+                print(f"Skipping inaccessible folder: {folder}")
+                return
+                
+            realp = os.path.realpath(folder)
+            if realp in self.visited_dirs:
+                return
+            self.visited_dirs.add(realp)
 
-        if folder not in self.folder_tree_data:
-            self.folder_tree_data[folder] = {'checked': False, 'is_dir': True}
+            if folder not in self.folder_tree_data:
+                self.folder_tree_data[folder] = {'checked': False, 'is_dir': True}
 
-        root_text = os.path.basename(folder) or folder
-        root_id = self.tree.insert("", tk.END, text=root_text, open=False)
-        self.tree_ids_map[folder] = root_id
+            root_text = os.path.basename(folder) or folder
+            root_id = self.tree.insert("", tk.END, text=root_text, open=False)
+            self.tree_ids_map[folder] = root_id
 
-        self.add_directory_contents(folder, root_id)
-        # Don't automatically open root folders - let expand_to_show_selected handle this
+            self.add_directory_contents(folder, root_id)
+            # Don't automatically open root folders - let expand_to_show_selected handle this
+            
+        except Exception as e:
+            print(f"Error building tree for {folder}: {e}")
+            # Add a placeholder node to show the folder exists but had issues
+            if folder not in self.folder_tree_data:
+                self.folder_tree_data[folder] = {'checked': False, 'is_dir': True}
+                root_text = f"{os.path.basename(folder) or folder} (⚠️ Access Error)"
+                root_id = self.tree.insert("", tk.END, text=root_text, open=False)
+                self.tree_ids_map[folder] = root_id
+
+    def check_folder_access_with_timeout(self, folder_path):
+        """Check if a folder is accessible within a timeout period."""
+        try:
+            if os.name == 'nt':  # Windows
+                result_queue = queue.Queue()
+                
+                def check_access():
+                    try:
+                        exists = os.path.exists(folder_path)
+                        if exists:
+                            # Try to list directory to ensure it's actually accessible
+                            os.listdir(folder_path)
+                        result_queue.put(exists)
+                    except Exception as e:
+                        result_queue.put(False)
+                
+                thread = threading.Thread(target=check_access, daemon=True)
+                thread.start()
+                thread.join(timeout=FOLDER_ACCESS_TIMEOUT)
+                
+                if thread.is_alive():
+                    print(f"Folder access timed out: {folder_path}")
+                    return False
+                    
+                return result_queue.get() if not result_queue.empty() else False
+                
+            else:  # Unix-like systems
+                with FolderLoadingTimeout(FOLDER_ACCESS_TIMEOUT):
+                    if os.path.exists(folder_path):
+                        os.listdir(folder_path)  # Test actual access
+                        return True
+                    return False
+                    
+        except (TimeoutError, OSError, IOError) as e:
+            print(f"Folder access failed for {folder_path}: {e}")
+            return False
 
     def add_directory_contents(self, directory_path, parent_id):
+        """Add directory contents with timeout handling."""
         try:
+            # Check access with timeout before proceeding
+            if not self.check_folder_access_with_timeout(directory_path):
+                return
+                
             items = sorted(os.listdir(directory_path))
-        except PermissionError:
+        except (PermissionError, OSError, IOError) as e:
+            print(f"Cannot access directory {directory_path}: {e}")
             return
 
         for item in items:
@@ -964,25 +1299,334 @@ class FolderMonitorApp:
                 continue
 
             # If physically the same as parent, skip (avoid repeated folder name)
-            parent_real = os.path.realpath(directory_path)
-            child_real = os.path.realpath(path)
-            if os.path.samefile(directory_path, path):
-                # This means child is literally the same as the parent
+            try:
+                parent_real = os.path.realpath(directory_path)
+                child_real = os.path.realpath(path)
+                if os.path.samefile(directory_path, path):
+                    # This means child is literally the same as the parent
+                    continue
+            except (OSError, IOError):
+                # If we can't determine samefile, skip to be safe
                 continue
 
             if child_real in self.visited_dirs and os.path.isdir(path):
                 # Already processed this directory
                 continue
 
-            is_dir = os.path.isdir(path)
+            try:
+                is_dir = os.path.isdir(path)
+            except (OSError, IOError):
+                # If we can't determine if it's a directory, skip it
+                continue
+                
             self.folder_tree_data[path] = {'checked': False, 'is_dir': is_dir}
 
-            node_id = self.tree.insert(parent_id, tk.END, text=item, open=False)
+            # Add item name with indicator if it might be problematic
+            item_text = item
+            if is_dir and self.is_potentially_problematic_path(path):
+                item_text = f"{item} ⚠️"
+
+            node_id = self.tree.insert(parent_id, tk.END, text=item_text, open=False)
             self.tree_ids_map[path] = node_id
 
             if is_dir:
                 self.visited_dirs.add(child_real)
-                self.add_directory_contents(path, node_id)
+                # For subdirectories, use a reduced timeout or skip if it seems problematic
+                if not self.is_potentially_problematic_path(path):
+                    self.add_directory_contents(path, node_id)
+                else:
+                    print(f"Skipping potentially problematic subdirectory: {path}")
+    
+    def build_tree_for_with_dialog(self, folder):
+        """
+        Build tree for a folder with dialog progress updates.
+        """
+        try:
+            if self.loading_dialog:
+                self.loading_dialog.update_detail(f"Checking access: {folder}")
+            
+            # Check if folder exists with a timeout
+            if not self.check_folder_access_with_timeout(folder):
+                print(f"Skipping inaccessible folder: {folder}")
+                if self.loading_dialog:
+                    self.loading_dialog.update_detail(f"⚠️ Skipped (inaccessible): {folder}")
+                return
+                
+            realp = os.path.realpath(folder)
+            if realp in self.visited_dirs:
+                return
+            self.visited_dirs.add(realp)
+
+            if folder not in self.folder_tree_data:
+                self.folder_tree_data[folder] = {'checked': False, 'is_dir': True}
+
+            root_text = os.path.basename(folder) or folder
+            root_id = self.tree.insert("", tk.END, text=root_text, open=False)
+            self.tree_ids_map[folder] = root_id
+
+            if self.loading_dialog:
+                self.loading_dialog.update_detail(f"Scanning: {folder}")
+            
+            self.add_directory_contents_with_dialog(folder, root_id)
+            # Don't automatically open root folders - let expand_to_show_selected handle this
+            
+        except Exception as e:
+            print(f"Error building tree for {folder}: {e}")
+            if self.loading_dialog:
+                self.loading_dialog.update_detail(f"⚠️ Error with: {folder}")
+            # Add a placeholder node to show the folder exists but had issues
+            if folder not in self.folder_tree_data:
+                self.folder_tree_data[folder] = {'checked': False, 'is_dir': True}
+                root_text = f"{os.path.basename(folder) or folder} (⚠️ Access Error)"
+                root_id = self.tree.insert("", tk.END, text=root_text, open=False)
+                self.tree_ids_map[folder] = root_id
+    
+    def build_tree_for_with_dialog_threaded(self, folder, cancel_flag):
+        """
+        Build tree for a folder with dialog progress updates, designed for threading.
+        """
+        def update_dialog_safe(detail_text):
+            """Safely update dialog from thread."""
+            try:
+                if self.loading_dialog:
+                    self.master.after_idle(lambda: self.loading_dialog.update_detail(detail_text))
+            except:
+                pass
+        
+        try:
+            update_dialog_safe(f"Checking access: {folder}")
+            
+            # Check for cancellation
+            if cancel_flag.is_set():
+                return
+            
+            # Check if folder exists with a timeout
+            if not self.check_folder_access_with_timeout(folder):
+                print(f"Skipping inaccessible folder: {folder}")
+                update_dialog_safe(f"⚠️ Skipped (inaccessible): {folder}")
+                return
+                
+            realp = os.path.realpath(folder)
+            if realp in self.visited_dirs:
+                return
+            self.visited_dirs.add(realp)
+
+            if folder not in self.folder_tree_data:
+                self.folder_tree_data[folder] = {'checked': False, 'is_dir': True}
+
+            root_text = os.path.basename(folder) or folder
+            
+            # Add tree item from main thread
+            def add_tree_item():
+                root_id = self.tree.insert("", tk.END, text=root_text, open=False)
+                self.tree_ids_map[folder] = root_id
+                return root_id
+            
+            # We need to get the root_id synchronously
+            root_id_result = queue.Queue()
+            def get_root_id():
+                root_id = add_tree_item()
+                root_id_result.put(root_id)
+            
+            self.master.after_idle(get_root_id)
+            
+            # Wait for the tree item to be created
+            start_wait = time.time()
+            while root_id_result.empty() and time.time() - start_wait < 5:
+                if cancel_flag.is_set():
+                    return
+                time.sleep(0.05)
+            
+            if root_id_result.empty():
+                print(f"Timeout waiting for tree item creation for {folder}")
+                return
+                
+            root_id = root_id_result.get()
+
+            update_dialog_safe(f"Scanning: {folder}")
+            
+            self.add_directory_contents_with_dialog_threaded(folder, root_id, cancel_flag)
+            
+        except Exception as e:
+            print(f"Error building tree for {folder}: {e}")
+            update_dialog_safe(f"⚠️ Error with: {folder}")
+            # Add a placeholder node to show the folder exists but had issues
+            if folder not in self.folder_tree_data:
+                self.folder_tree_data[folder] = {'checked': False, 'is_dir': True}
+                root_text = f"{os.path.basename(folder) or folder} (⚠️ Access Error)"
+                def add_error_node():
+                    root_id = self.tree.insert("", tk.END, text=root_text, open=False)
+                    self.tree_ids_map[folder] = root_id
+                self.master.after_idle(add_error_node)
+
+    def add_directory_contents_with_dialog(self, directory_path, parent_id):
+        """Add directory contents with dialog progress updates."""
+        try:
+            # Check if user cancelled
+            if self.loading_dialog and self.loading_dialog.is_cancelled():
+                return
+                
+            # Check access with timeout before proceeding
+            if not self.check_folder_access_with_timeout(directory_path):
+                return
+                
+            items = sorted(os.listdir(directory_path))
+        except (PermissionError, OSError, IOError) as e:
+            print(f"Cannot access directory {directory_path}: {e}")
+            return
+
+        for item in items:
+            # Check if user cancelled during iteration
+            if self.loading_dialog and self.loading_dialog.is_cancelled():
+                break
+                
+            path = os.path.join(directory_path, item)
+
+            # If ignore, skip
+            if self.filters_match(path):
+                continue
+
+            # If physically the same as parent, skip (avoid repeated folder name)
+            try:
+                parent_real = os.path.realpath(directory_path)
+                child_real = os.path.realpath(path)
+                if os.path.samefile(directory_path, path):
+                    # This means child is literally the same as the parent
+                    continue
+            except (OSError, IOError):
+                # If we can't determine samefile, skip to be safe
+                continue
+
+            if child_real in self.visited_dirs and os.path.isdir(path):
+                # Already processed this directory
+                continue
+
+            try:
+                is_dir = os.path.isdir(path)
+            except (OSError, IOError):
+                # If we can't determine if it's a directory, skip it
+                continue
+                
+            self.folder_tree_data[path] = {'checked': False, 'is_dir': is_dir}
+
+            # Add item name with indicator if it might be problematic
+            item_text = item
+            if is_dir and self.is_potentially_problematic_path(path):
+                item_text = f"{item} ⚠️"
+
+            node_id = self.tree.insert(parent_id, tk.END, text=item_text, open=False)
+            self.tree_ids_map[path] = node_id
+
+            if is_dir:
+                self.visited_dirs.add(child_real)
+                # For subdirectories, use a reduced timeout or skip if it seems problematic
+                if not self.is_potentially_problematic_path(path):
+                    # Update dialog with current subdirectory being processed
+                    if self.loading_dialog:
+                        self.loading_dialog.update_detail(f"Scanning: {path}")
+                    self.add_directory_contents_with_dialog(path, node_id)
+                else:
+                    print(f"Skipping potentially problematic subdirectory: {path}")
+
+    def add_directory_contents_with_dialog_threaded(self, directory_path, parent_id, cancel_flag):
+        """Add directory contents with dialog progress updates, designed for threading."""
+        def update_dialog_safe(detail_text):
+            """Safely update dialog from thread."""
+            try:
+                if self.loading_dialog:
+                    self.master.after_idle(lambda: self.loading_dialog.update_detail(detail_text))
+            except:
+                pass
+        
+        try:
+            # Check for cancellation
+            if cancel_flag.is_set():
+                return
+                
+            # Check access with timeout before proceeding
+            if not self.check_folder_access_with_timeout(directory_path):
+                return
+                
+            items = sorted(os.listdir(directory_path))
+        except (PermissionError, OSError, IOError) as e:
+            print(f"Cannot access directory {directory_path}: {e}")
+            return
+
+        for item in items:
+            # Check for cancellation during iteration
+            if cancel_flag.is_set():
+                break
+                
+            path = os.path.join(directory_path, item)
+
+            # If ignore, skip
+            if self.filters_match(path):
+                continue
+
+            # If physically the same as parent, skip (avoid repeated folder name)
+            try:
+                parent_real = os.path.realpath(directory_path)
+                child_real = os.path.realpath(path)
+                if os.path.samefile(directory_path, path):
+                    # This means child is literally the same as the parent
+                    continue
+            except (OSError, IOError):
+                # If we can't determine samefile, skip to be safe
+                continue
+
+            if child_real in self.visited_dirs and os.path.isdir(path):
+                # Already processed this directory
+                continue
+
+            try:
+                is_dir = os.path.isdir(path)
+            except (OSError, IOError):
+                # If we can't determine if it's a directory, skip it
+                continue
+                
+            self.folder_tree_data[path] = {'checked': False, 'is_dir': is_dir}
+
+            # Add item name with indicator if it might be problematic
+            item_text = item
+            if is_dir and self.is_potentially_problematic_path(path):
+                item_text = f"{item} ⚠️"
+
+            # Add tree item from main thread
+            def add_tree_item():
+                node_id = self.tree.insert(parent_id, tk.END, text=item_text, open=False)
+                self.tree_ids_map[path] = node_id
+                return node_id
+            
+            # We need to get the node_id synchronously
+            node_id_result = queue.Queue()
+            def get_node_id():
+                node_id = add_tree_item()
+                node_id_result.put(node_id)
+            
+            self.master.after_idle(get_node_id)
+            
+            # Wait for the tree item to be created
+            start_wait = time.time()
+            while node_id_result.empty() and time.time() - start_wait < 5:
+                if cancel_flag.is_set():
+                    return
+                time.sleep(0.05)
+            
+            if node_id_result.empty():
+                print(f"Timeout waiting for tree item creation for {path}")
+                continue
+                
+            node_id = node_id_result.get()
+
+            if is_dir:
+                self.visited_dirs.add(child_real)
+                # For subdirectories, use a reduced timeout or skip if it seems problematic
+                if not self.is_potentially_problematic_path(path):
+                    # Update dialog with current subdirectory being processed
+                    update_dialog_safe(f"Scanning: {path}")
+                    self.add_directory_contents_with_dialog_threaded(path, node_id, cancel_flag)
+                else:
+                    print(f"Skipping potentially problematic subdirectory: {path}")
 
     def apply_saved_checks(self):
         """Apply saved check states from config, respecting filters."""
@@ -1656,6 +2300,7 @@ class FolderMonitorApp:
                         "prepend_string": self.prepend_string,
                         "prepend_hotkey_enabled": self.prepend_hotkey_enabled.get(),
                         "hotkey_combination": self.hotkey_combination,
+                        "enable_timeouts": self.enable_timeouts.get(),
                     }
                     for path, info in self.folder_tree_data.items():
                         data["folder_checks"][path] = info['checked']
@@ -1718,6 +2363,7 @@ class FolderMonitorApp:
                 self.prepend_string = data.get("prepend_string", DEFAULT_PREPEND_STRING)
                 self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
                 self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
+                self.enable_timeouts.set(data.get("enable_timeouts", True))
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
         
@@ -1794,6 +2440,600 @@ class FolderMonitorApp:
         except Exception as e:
             print(f"Error loading last profile: {e}")
         return "default"
+    
+    def load_last_profile_with_fallback(self):
+        """Load the last selected profile with fallback to a working profile if needed."""
+        last_profile = self.load_last_profile()
+        
+        # If it's the default profile, just return it
+        if last_profile == "default":
+            return last_profile
+            
+        # Check if the profile file exists
+        profile_path = os.path.join(PROFILES_DIR, f"{last_profile}.json")
+        if not os.path.exists(profile_path):
+            print(f"Profile file {profile_path} not found, falling back to default")
+            return "default"
+            
+        # Try to quickly validate the profile by checking for problematic paths
+        try:
+            with open(profile_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                root_folders = data.get("root_folders", [])
+                
+                # Check if any folders might be network/FTP paths
+                problematic_folders = []
+                for folder in root_folders:
+                    if self.is_potentially_problematic_path(folder):
+                        problematic_folders.append(folder)
+                
+                # If we found problematic folders, we'll return this profile but mark it for careful loading
+                if problematic_folders:
+                    print(f"Found potentially problematic folders in {last_profile}: {problematic_folders}")
+                    
+                return last_profile
+                    
+        except Exception as e:
+            print(f"Error validating profile {last_profile}: {e}")
+            return "default"
+    
+    def is_potentially_problematic_path(self, path):
+        """Check if a path might be problematic (network, FTP, etc.)"""
+        # Check for network paths
+        if path.startswith('\\\\') or path.startswith('//'):
+            return True
+        
+        # Check for FTP-like URLs  
+        if any(path.lower().startswith(protocol) for protocol in ['ftp://', 'sftp://', 'ftps://']):
+            return True
+            
+        # Check for very long paths that might be network mounted
+        if len(path) > 200:
+            return True
+            
+        # Check for paths that don't exist locally
+        try:
+            if not os.path.exists(path):
+                return True
+        except (OSError, IOError):
+            return True
+            
+        return False
+    
+    def load_settings_with_timeout(self):
+        """Load settings with timeout handling and fallback mechanisms."""
+        original_profile = self.current_profile
+        
+        # Show loading dialog
+        self.loading_dialog = LoadingDialog(self.master, f"Loading Profile: {original_profile}")
+        self.loading_dialog.update_operation(f"Loading profile '{original_profile}'...")
+        
+        try:
+            # Try to load with timeout
+            if os.name == 'nt':  # Windows - use threading approach
+                self.load_settings_windows_timeout_with_dialog()
+            else:  # Unix-like systems - use signal approach
+                with FolderLoadingTimeout(FOLDER_LOADING_TIMEOUT):
+                    self.load_settings_with_dialog()
+                    
+        except (TimeoutError, Exception) as e:
+            print(f"Failed to load profile '{original_profile}': {e}")
+            
+            # Check if user cancelled
+            if self.loading_dialog and self.loading_dialog.is_cancelled():
+                cancel_type = self.loading_dialog.get_cancel_type()
+                if cancel_type == "cancel":
+                    # User wants to use default profile
+                    self.current_profile = "default"
+                    self.is_fallback_profile = True
+                    self.loading_dialog.update_operation("Loading default profile...")
+                    try:
+                        self.load_minimal_settings()
+                    except Exception:
+                        self.load_minimal_settings()
+                elif cancel_type == "skip":
+                    # User wants to skip to a working fallback
+                    self.is_fallback_profile = True
+                    fallback_profile = self.find_working_fallback_profile()
+                    self.current_profile = fallback_profile
+                    self.loading_dialog.update_operation(f"Loading fallback profile '{fallback_profile}'...")
+                    try:
+                        if os.name == 'nt':
+                            self.load_settings_windows_timeout_with_dialog()
+                        else:
+                            with FolderLoadingTimeout(FOLDER_LOADING_TIMEOUT):
+                                self.load_settings_with_dialog()
+                    except Exception:
+                        self.load_minimal_settings()
+            else:
+                # Automatic fallback due to timeout
+                self.is_fallback_profile = True
+                
+                # Try to find a working fallback profile
+                fallback_profile = self.find_working_fallback_profile()
+                
+                if fallback_profile != original_profile:
+                    print(f"Falling back to profile: {fallback_profile}")
+                    self.current_profile = fallback_profile
+                    # Don't save this as the last profile - we want to remember the user's preference
+                    
+                    if self.loading_dialog:
+                        self.loading_dialog.update_operation(f"Loading fallback profile '{fallback_profile}'...")
+                    
+                    # Try loading the fallback profile
+                    try:
+                        if os.name == 'nt':
+                            self.load_settings_windows_timeout_with_dialog()
+                        else:
+                            with FolderLoadingTimeout(FOLDER_LOADING_TIMEOUT):
+                                self.load_settings_with_dialog()
+                    except Exception as fallback_error:
+                        print(f"Even fallback profile failed: {fallback_error}")
+                        # Load absolute minimum - clear everything
+                        self.load_minimal_settings()
+                else:
+                    # Load minimal settings as last resort
+                    self.load_minimal_settings()
+        
+        finally:
+            # Close loading dialog
+            if self.loading_dialog:
+                self.loading_dialog.close()
+                self.loading_dialog = None
+    
+    def load_settings_windows_timeout(self):
+        """Load settings with timeout on Windows using threading."""
+        result_queue = queue.Queue()
+        exception_queue = queue.Queue()
+        
+        def load_thread():
+            try:
+                self.load_settings()
+                result_queue.put("success")
+            except Exception as e:
+                exception_queue.put(e)
+        
+        thread = threading.Thread(target=load_thread, daemon=True)
+        thread.start()
+        thread.join(timeout=FOLDER_LOADING_TIMEOUT)
+        
+        if thread.is_alive():
+            # Thread is still running - it timed out
+            raise TimeoutError(f"Settings loading timed out after {FOLDER_LOADING_TIMEOUT} seconds")
+        
+        # Check if there were any exceptions
+        if not exception_queue.empty():
+            raise exception_queue.get()
+    
+    def load_settings_windows_timeout_with_dialog(self):
+        """Load settings with timeout on Windows using threading, with progress dialog."""
+        result_queue = queue.Queue()
+        exception_queue = queue.Queue()
+        cancel_flag = threading.Event()
+        
+        def load_thread():
+            try:
+                self.load_settings_with_dialog_threaded(cancel_flag)
+                result_queue.put("success")
+            except Exception as e:
+                exception_queue.put(e)
+        
+        thread = threading.Thread(target=load_thread, daemon=True)
+        thread.start()
+        
+        # Monitor the thread with periodic checks for cancellation
+        start_time = time.time()
+        timeouts_disabled = False
+        
+        while thread.is_alive():
+            # Process GUI events to keep dialog responsive
+            try:
+                self.master.update()
+            except:
+                break  # Window closed
+                
+            # Check if user cancelled or disabled timeouts
+            if self.loading_dialog and self.loading_dialog.is_cancelled():
+                cancel_type = self.loading_dialog.get_cancel_type()
+                if cancel_type == "disable_timeouts":
+                    timeouts_disabled = True
+                    self.enable_timeouts.set(False)  # Update the checkbox
+                    # Continue monitoring but without timeout
+                elif cancel_type in ["skip", "cancel"]:
+                    # Signal the thread to stop and break out
+                    cancel_flag.set()
+                    break
+                
+            # Check for timeout only if timeouts are enabled and not disabled by user
+            if not timeouts_disabled and self.enable_timeouts.get():
+                if time.time() - start_time > FOLDER_LOADING_TIMEOUT:
+                    cancel_flag.set()
+                    raise TimeoutError(f"Settings loading timed out after {FOLDER_LOADING_TIMEOUT} seconds")
+            
+            # Sleep briefly to avoid busy waiting
+            time.sleep(0.1)
+        
+        # Wait a bit more for the thread to complete (or longer if timeouts disabled)
+        wait_time = 1.0 if self.enable_timeouts.get() and not timeouts_disabled else None
+        thread.join(timeout=wait_time)
+        
+        # Check if user cancelled (but not if they disabled timeouts)
+        if self.loading_dialog and self.loading_dialog.is_cancelled():
+            cancel_type = self.loading_dialog.get_cancel_type()
+            if cancel_type != "disable_timeouts":
+                raise TimeoutError("User cancelled loading")
+        
+        # Only check for timeout if timeouts are still enabled and thread is still alive
+        if thread.is_alive() and self.enable_timeouts.get() and not timeouts_disabled:
+            # Thread is still running - it timed out
+            cancel_flag.set()
+            raise TimeoutError(f"Settings loading timed out after {FOLDER_LOADING_TIMEOUT} seconds")
+        
+        # Check if there were any exceptions
+        if not exception_queue.empty():
+            raise exception_queue.get()
+
+    def load_settings_windows_no_timeout_with_dialog(self):
+        """Load settings without timeout using threading, but keep UI responsive for cancellation."""
+        result_queue = queue.Queue()
+        exception_queue = queue.Queue()
+        cancel_flag = threading.Event()
+        
+        def load_thread():
+            try:
+                self.load_settings_with_dialog_threaded(cancel_flag)
+                result_queue.put("success")
+            except Exception as e:
+                exception_queue.put(e)
+        
+        thread = threading.Thread(target=load_thread, daemon=True)
+        thread.start()
+        
+        # Monitor the thread with periodic checks for cancellation (no timeout)
+        while thread.is_alive():
+            # Process GUI events to keep dialog responsive
+            try:
+                self.master.update()
+            except:
+                break  # Window closed
+                
+            # Check if user cancelled
+            if self.loading_dialog and self.loading_dialog.is_cancelled():
+                cancel_type = self.loading_dialog.get_cancel_type()
+                if cancel_type in ["skip", "cancel"]:
+                    # Signal the thread to stop and break out
+                    cancel_flag.set()
+                    break
+            
+            # Sleep briefly to avoid busy waiting
+            time.sleep(0.1)
+        
+        # Wait for the thread to complete
+        thread.join(timeout=2.0)
+        
+        # Check if user cancelled
+        if self.loading_dialog and self.loading_dialog.is_cancelled():
+            cancel_type = self.loading_dialog.get_cancel_type()
+            if cancel_type in ["skip", "cancel"]:
+                raise TimeoutError("User cancelled loading")
+        
+        # Check if there were any exceptions
+        if not exception_queue.empty():
+            raise exception_queue.get()
+    
+    def load_settings_with_dialog_threaded(self, cancel_flag):
+        """Load settings with progress updates to the dialog, designed for threading with cancellation."""
+        def update_dialog_safe(operation_text):
+            """Safely update dialog from thread."""
+            try:
+                if self.loading_dialog:
+                    self.master.after_idle(lambda: self.loading_dialog.update_operation(operation_text))
+            except:
+                pass
+        
+        update_dialog_safe("Reading profile configuration...")
+        
+        # Check for cancellation
+        if cancel_flag.is_set():
+            return
+            
+        is_first_launch = False
+        
+        if self.current_profile == "default":
+            if not os.path.exists(CONFIG_FILE):
+                # Add default meta prompt and ignore patterns for new installations
+                self.add_default_meta_prompts()
+                self.ignore_patterns = self.default_initial_ignore_patterns.copy()
+                is_first_launch = True
+                # We'll skip loading from file but still update the UI
+                self.save_settings()  # Create the file for next time
+            else:
+                config_path = CONFIG_FILE
+        else:
+            config_path = os.path.join(PROFILES_DIR, f"{self.current_profile}.json")
+            if not os.path.exists(config_path):
+                # Add defaults for new profile
+                self.add_default_meta_prompts()
+                self.ignore_patterns = self.default_initial_ignore_patterns.copy()
+                is_first_launch = True
+                self.save_settings()  # Create the file for next time
+        
+        if not is_first_launch:  # Only load from file if it's not first launch
+            try:
+                update_dialog_safe("Loading profile data...")
+                
+                # Check for cancellation
+                if cancel_flag.is_set():
+                    return
+                    
+                # Clear existing data
+                self.folder_tree_data.clear() 
+                self.tree_ids_map.clear()
+                self.saved_folder_checks.clear()
+                self.visited_dirs.clear()
+                
+                # Remove all items from tree view
+                self.master.after_idle(lambda: self.tree.delete(*self.tree.get_children()))
+                
+                # Load new settings
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                self.root_folders = data.get("root_folders", [])
+                self.user_instructions = data.get("user_instructions", "")
+                self.meta_prompts = data.get("meta_prompts", [])
+                # Check if we need to add the default meta prompt
+                if not self.meta_prompts:
+                    self.add_default_meta_prompts()
+                
+                self.saved_folder_checks = data.get("folder_checks", {})
+                self.ignore_patterns = data.get("ignore_patterns", [])
+                self.copy_entire_tree_var.set(data.get("copy_entire_tree", False))
+                self.filter_system_folders.set(data.get("filter_system_folders", True))
+                self.dark_mode.set(data.get("dark_mode", False))
+                self.prepend_string = data.get("prepend_string", DEFAULT_PREPEND_STRING)
+                self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
+                self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
+                self.enable_timeouts.set(data.get("enable_timeouts", True))
+            except Exception as e:
+                self.master.after_idle(lambda: messagebox.showerror("Error Loading Settings", str(e)))
+        
+        # Check for cancellation before building trees
+        if cancel_flag.is_set():
+            return
+            
+        # Always update the UI, whether it's first launch or not
+        
+        update_dialog_safe("Building folder tree...")
+        
+        # Build the tree with current settings
+        self.build_all_trees_with_dialog_threaded(cancel_flag)
+        
+        # Check for cancellation
+        if cancel_flag.is_set():
+            return
+            
+        update_dialog_safe("Updating interface...")
+        
+        # Update UI - these need to be called from main thread
+        def update_ui():
+            if hasattr(self, 'instructions_text'):
+                self.instructions_text.delete("1.0", tk.END)
+                self.instructions_text.insert("1.0", self.user_instructions)
+            
+            if hasattr(self, 'filters_text'):
+                self.filters_text.delete("1.0", tk.END)
+                self.filters_text.insert("1.0", "\n".join(self.ignore_patterns))
+            
+            self.refresh_prompts_listbox()
+            
+            # Load history for this profile
+            self.load_history()
+
+            if hasattr(self, 'prepend_entry'):
+                self.prepend_entry.delete(0, tk.END)
+                self.prepend_entry.insert(0, self.prepend_string)
+                # Ensure the entry shows the full text by moving to the beginning
+                self.prepend_entry.icursor(0)
+            if hasattr(self, 'prepend_hotkey_check'):
+                self.prepend_hotkey_check.select() if self.prepend_hotkey_enabled.get() else self.prepend_hotkey_check.deselect()
+            if hasattr(self, 'hotkey_display'):
+                self.hotkey_display.config(text=self.hotkey_combination.upper())
+            
+            # Update dark mode checkbox to reflect loaded setting
+            if hasattr(self, 'dark_mode_check'):
+                if self.dark_mode.get():
+                    self.dark_mode_check.select()
+                else:
+                    self.dark_mode_check.deselect()
+        
+        self.master.after_idle(update_ui)
+
+    def load_settings_with_dialog(self):
+        """Load settings with progress updates to the dialog."""
+        if self.loading_dialog:
+            self.loading_dialog.update_operation("Reading profile configuration...")
+            
+        is_first_launch = False
+        
+        if self.current_profile == "default":
+            if not os.path.exists(CONFIG_FILE):
+                # Add default meta prompt and ignore patterns for new installations
+                self.add_default_meta_prompts()
+                self.ignore_patterns = self.default_initial_ignore_patterns.copy()
+                is_first_launch = True
+                # We'll skip loading from file but still update the UI
+                self.save_settings()  # Create the file for next time
+            else:
+                config_path = CONFIG_FILE
+        else:
+            config_path = os.path.join(PROFILES_DIR, f"{self.current_profile}.json")
+            if not os.path.exists(config_path):
+                # Add defaults for new profile
+                self.add_default_meta_prompts()
+                self.ignore_patterns = self.default_initial_ignore_patterns.copy()
+                is_first_launch = True
+                self.save_settings()  # Create the file for next time
+        
+        if not is_first_launch:  # Only load from file if it's not first launch
+            try:
+                if self.loading_dialog:
+                    self.loading_dialog.update_operation("Loading profile data...")
+                    
+                # Clear existing data
+                self.folder_tree_data.clear() 
+                self.tree_ids_map.clear()
+                self.saved_folder_checks.clear()
+                self.visited_dirs.clear()
+                
+                # Remove all items from tree view
+                self.tree.delete(*self.tree.get_children())
+                
+                # Load new settings
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                self.root_folders = data.get("root_folders", [])
+                self.user_instructions = data.get("user_instructions", "")
+                self.meta_prompts = data.get("meta_prompts", [])
+                # Check if we need to add the default meta prompt
+                if not self.meta_prompts:
+                    self.add_default_meta_prompts()
+                
+                self.saved_folder_checks = data.get("folder_checks", {})
+                self.ignore_patterns = data.get("ignore_patterns", [])
+                self.copy_entire_tree_var.set(data.get("copy_entire_tree", False))
+                self.filter_system_folders.set(data.get("filter_system_folders", True))
+                self.dark_mode.set(data.get("dark_mode", False))
+                self.prepend_string = data.get("prepend_string", DEFAULT_PREPEND_STRING)
+                self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
+                self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
+                self.enable_timeouts.set(data.get("enable_timeouts", True))
+            except Exception as e:
+                messagebox.showerror("Error Loading Settings", str(e))
+        
+        # Always update the UI, whether it's first launch or not
+        
+        if self.loading_dialog:
+            self.loading_dialog.update_operation("Building folder tree...")
+        
+        # Build the tree with current settings
+        self.build_all_trees_with_dialog()
+        
+        if self.loading_dialog:
+            self.loading_dialog.update_operation("Updating interface...")
+        
+        # Update UI
+        if hasattr(self, 'instructions_text'):
+            self.instructions_text.delete("1.0", tk.END)
+            self.instructions_text.insert("1.0", self.user_instructions)
+        
+        if hasattr(self, 'filters_text'):
+            self.filters_text.delete("1.0", tk.END)
+            self.filters_text.insert("1.0", "\n".join(self.ignore_patterns))
+        
+        self.refresh_prompts_listbox()
+        
+        # Load history for this profile
+        if self.loading_dialog:
+            self.loading_dialog.update_operation("Loading history...")
+        self.load_history()
+
+        if hasattr(self, 'prepend_entry'):
+            self.prepend_entry.delete(0, tk.END)
+            self.prepend_entry.insert(0, self.prepend_string)
+            # Ensure the entry shows the full text by moving to the beginning
+            self.prepend_entry.icursor(0)
+        if hasattr(self, 'prepend_hotkey_check'):
+            self.prepend_hotkey_check.select() if self.prepend_hotkey_enabled.get() else self.prepend_hotkey_check.deselect()
+        if hasattr(self, 'hotkey_display'):
+            self.hotkey_display.config(text=self.hotkey_combination.upper())
+        
+        # Update dark mode checkbox to reflect loaded setting
+        if hasattr(self, 'dark_mode_check'):
+            if self.dark_mode.get():
+                self.dark_mode_check.select()
+            else:
+                self.dark_mode_check.deselect()
+        
+        if self.loading_dialog:
+            self.loading_dialog.update_operation("Loading complete!")
+        
+        # Note: setup_global_hotkey() is called after theme is applied in __init__
+    
+    def find_working_fallback_profile(self):
+        """Find a profile that's likely to work (no network paths)."""
+        available_profiles = self.get_available_profiles()
+        
+        # Try profiles in order of preference
+        for profile_name in ["default"] + [p for p in available_profiles if p != "default"]:
+            if profile_name == self.current_profile:
+                continue  # Skip the one that failed
+                
+            try:
+                profile_path = os.path.join(PROFILES_DIR, f"{profile_name}.json") if profile_name != "default" else CONFIG_FILE
+                
+                if profile_name == "default" and not os.path.exists(CONFIG_FILE):
+                    return "default"  # Default will create minimal settings
+                    
+                if not os.path.exists(profile_path):
+                    continue
+                    
+                with open(profile_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    root_folders = data.get("root_folders", [])
+                    
+                    # Check if this profile has only safe, local paths
+                    has_problematic_paths = False
+                    for folder in root_folders:
+                        if self.is_potentially_problematic_path(folder):
+                            has_problematic_paths = True
+                            break
+                    
+                    if not has_problematic_paths:
+                        return profile_name
+                        
+            except Exception as e:
+                print(f"Error checking profile {profile_name}: {e}")
+                continue
+        
+        return "default"
+    
+    def load_minimal_settings(self):
+        """Load minimal settings when everything else fails."""
+        print("Loading minimal settings as fallback")
+        
+        # Clear everything
+        self.root_folders = []
+        self.user_instructions = ""
+        self.meta_prompts = []
+        self.saved_folder_checks = {}
+        self.ignore_patterns = self.default_initial_ignore_patterns.copy()
+        self.copy_entire_tree_var.set(False)
+        self.filter_system_folders.set(True)
+        self.dark_mode.set(False)
+        self.prepend_string = DEFAULT_PREPEND_STRING
+        self.prepend_hotkey_enabled.set(False)
+        self.hotkey_combination = "ctrl+alt+v"
+        
+        # Add default meta prompt
+        self.add_default_meta_prompts()
+        
+        # Clear tree data
+        self.folder_tree_data.clear()
+        self.tree_ids_map.clear()
+        self.visited_dirs.clear()
+        
+        # Update UI elements if they exist
+        if hasattr(self, 'instructions_text'):
+            self.instructions_text.delete("1.0", tk.END)
+            self.instructions_text.insert("1.0", self.user_instructions)
+        
+        if hasattr(self, 'filters_text'):
+            self.filters_text.delete("1.0", tk.END)
+            self.filters_text.insert("1.0", "\n".join(self.ignore_patterns))
+            
+        # Don't try to load history or build trees - just get the app running
     
     def save_last_profile(self, profile_name):
         """Save the currently selected profile as the last used profile."""
@@ -1936,40 +3176,90 @@ class FolderMonitorApp:
         btn_no.pack(side=tk.LEFT, padx=5)
 
     def on_profile_selected(self, event):
-        """Handle profile selection change."""
+        """Handle profile selection change with loading dialog."""
         new_profile = self.profile_var.get()
         if new_profile != self.current_profile:
             # Save current profile before switching
             self.save_settings()
             
             # Switch to new profile
+            old_profile = self.current_profile
             self.current_profile = new_profile
             
             # Save as last used profile
             self.save_last_profile(new_profile)
             
-            # Clear all data structures completely
-            self.folder_tree_data.clear()
-            self.tree_ids_map.clear()
-            self.saved_folder_checks.clear()
-            self.visited_dirs.clear()
+            # Show loading dialog for manual profile switch
+            self.loading_dialog = LoadingDialog(self.master, f"Switching to Profile: {new_profile}")
+            self.loading_dialog.update_operation(f"Switching to profile '{new_profile}'...")
             
-            # Remove all items from tree view
-            self.tree.delete(*self.tree.get_children())
-            
-            # Load the new profile
-            self.load_settings()
-            
-            # Validate checked items
-            self.validate_checked_items()
-            
-            # Clear history selection
-            self.selected_history_item = None
-            
-            # Expand tree to show selected items after a short delay
-            self.master.after(200, self.expand_to_show_selected)
-            
-            self.set_status(f"Switched to profile: {new_profile}")
+            try:
+                # Clear all data structures completely
+                self.folder_tree_data.clear()
+                self.tree_ids_map.clear()
+                self.saved_folder_checks.clear()
+                self.visited_dirs.clear()
+                
+                # Remove all items from tree view
+                self.tree.delete(*self.tree.get_children())
+                
+                # Load the new profile with timeout and dialog support
+                if self.enable_timeouts.get():
+                    # Use timeout-protected loading
+                    try:
+                        if os.name == 'nt':
+                            self.load_settings_windows_timeout_with_dialog()
+                        else:
+                            with FolderLoadingTimeout(FOLDER_LOADING_TIMEOUT):
+                                self.load_settings_with_dialog()
+                    except (TimeoutError, Exception) as e:
+                        print(f"Failed to load profile '{new_profile}': {e}")
+                        
+                        # Check if user disabled timeouts during loading
+                        if self.loading_dialog and self.loading_dialog.get_cancel_type() == "disable_timeouts":
+                            # User wants to continue without timeouts
+                            self.loading_dialog.update_operation("Loading without timeouts...")
+                            self.load_settings_windows_no_timeout_with_dialog()
+                        else:
+                            # Handle timeout or other errors
+                            self.current_profile = old_profile
+                            self.profile_var.set(old_profile)
+                            self.set_status(f"❌ Failed to switch to '{new_profile}' - staying with '{old_profile}'", 8000)
+                            return
+                else:
+                    # Load without timeouts but still use threading to keep UI responsive
+                    self.load_settings_windows_no_timeout_with_dialog()
+                
+                # Validate checked items
+                self.validate_checked_items()
+                
+                # Clear history selection
+                self.selected_history_item = None
+                
+                # Expand tree to show selected items after a short delay
+                self.master.after(200, self.expand_to_show_selected)
+                
+                self.set_status(f"✅ Switched to profile: {new_profile}")
+                
+                # Apply theme in case it changed
+                if self.dark_mode.get():
+                    self.current_theme = DARK_THEME
+                else:
+                    self.current_theme = LIGHT_THEME
+                self.apply_theme()
+                
+            except Exception as e:
+                print(f"Error switching to profile '{new_profile}': {e}")
+                # Revert to old profile
+                self.current_profile = old_profile
+                self.profile_var.set(old_profile)
+                self.set_status(f"❌ Error switching to '{new_profile}' - staying with '{old_profile}'", 8000)
+                
+            finally:
+                # Close loading dialog
+                if self.loading_dialog:
+                    self.loading_dialog.close()
+                    self.loading_dialog = None
 
     def save_profile(self, profile_name):
         """Save settings to a specific profile."""
@@ -1997,13 +3287,86 @@ class FolderMonitorApp:
             messagebox.showerror("Error Saving Profile", str(e))
 
     def on_toggle_system_filter(self):
-        """Handle the system folder filter toggle."""
-        # Rebuild the tree when the filter changes
-        self.visited_dirs.clear()
+        """Rebuild tree when system filter is toggled."""
         self.build_all_trees()
-        
-        # Save settings
         self.save_settings()
+        if self.filter_system_folders.get():
+            self.set_status("System folders are now hidden")
+        else:
+            self.set_status("System folders are now visible")
+
+    def on_toggle_timeout_control(self):
+        """Handle timeout control toggle."""
+        self.save_settings()
+        if self.enable_timeouts.get():
+            self.set_status("⏱️ Timeouts enabled - will timeout after configured time limits")
+        else:
+            self.set_status("⏳ Timeouts disabled - will wait indefinitely for folder loading")
+
+    def on_retry_original_profile(self):
+        """Retry loading the original profile that failed during startup."""
+        if not self.is_fallback_profile:
+            self.set_status("No failed profile to retry")
+            return
+            
+        # Get the original profile name from the last_profile.txt
+        original_profile = self.load_last_profile()
+        
+        if original_profile == self.current_profile:
+            self.set_status("Already using the original profile")
+            return
+        
+        self.set_status("Retrying original profile load...", 2000)
+        
+        # Try to load the original profile
+        old_profile = self.current_profile
+        self.current_profile = original_profile
+        self.is_fallback_profile = False
+        
+        try:
+            # Update the dropdown
+            self.profile_var.set(original_profile)
+            
+            # Show loading dialog for retry
+            self.loading_dialog = LoadingDialog(self.master, f"Retrying Profile: {original_profile}")
+            self.loading_dialog.update_operation(f"Retrying profile '{original_profile}'...")
+            
+            try:
+                # Try loading with timeout
+                if os.name == 'nt':
+                    self.load_settings_windows_timeout_with_dialog()
+                else:
+                    with FolderLoadingTimeout(FOLDER_LOADING_TIMEOUT):
+                        self.load_settings_with_dialog()
+                
+                # If we get here, it worked!
+                self.set_status(f"✅ Successfully loaded original profile: {original_profile}")
+                
+                # Hide the retry button
+                self.btn_retry_profile.pack_forget()
+                
+                # Apply the new theme
+                if self.dark_mode.get():
+                    self.current_theme = DARK_THEME
+                else:
+                    self.current_theme = LIGHT_THEME
+                self.apply_theme()
+                
+            finally:
+                # Close loading dialog
+                if self.loading_dialog:
+                    self.loading_dialog.close()
+                    self.loading_dialog = None
+            
+        except (TimeoutError, Exception) as e:
+            print(f"Retry failed for profile '{original_profile}': {e}")
+            
+            # Revert to the fallback profile
+            self.current_profile = old_profile
+            self.is_fallback_profile = True
+            self.profile_var.set(old_profile)
+            
+            self.set_status(f"❌ Retry failed - network/FTP folders still inaccessible. Staying with fallback profile.", 8000)
 
     # -----------------------------------------------------------------------
     #  HISTORY MANAGEMENT
@@ -2703,6 +4066,38 @@ Recommended combinations:
             print(f"Error during window close: {e}")
             # Force close even if there's an error
             self.master.destroy()
+
+    def _monitor_thread_non_blocking(self, thread, start_time, timeout_seconds, cancel_flag, exception_queue, result_queue, on_success, on_error):
+        """Periodically check thread status without blocking Tk mainloop."""
+        if thread.is_alive():
+            # Check for cancellation
+            if self.loading_dialog and self.loading_dialog.is_cancelled():
+                cancel_type = self.loading_dialog.get_cancel_type()
+                if cancel_type in ["skip", "cancel"]:
+                    cancel_flag.set()
+                    if on_error:
+                        on_error(TimeoutError("User cancelled loading"))
+                    return
+                elif cancel_type == "disable_timeouts":
+                    timeout_seconds = None  # Disable further timeout checks
+            
+            # Check timeout
+            if timeout_seconds is not None and (time.time() - start_time) > timeout_seconds:
+                cancel_flag.set()
+                if on_error:
+                    on_error(TimeoutError(f"Loading timed out after {timeout_seconds} seconds"))
+                return
+            
+            # Continue polling
+            self.master.after(100, lambda: self._monitor_thread_non_blocking(thread, start_time, timeout_seconds, cancel_flag, exception_queue, result_queue, on_success, on_error))
+        else:
+            # Thread finished
+            if not exception_queue.empty():
+                if on_error:
+                    on_error(exception_queue.get())
+            else:
+                if on_success:
+                    on_success()
 
 def main():
     root = tk.Tk()
