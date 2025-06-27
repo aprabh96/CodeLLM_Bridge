@@ -194,9 +194,11 @@ DARK_THEME = {
 }
 
 # Timeout settings for folder loading (configurable)
-FOLDER_LOADING_TIMEOUT = 10  # seconds - total time to load a profile
-FOLDER_ACCESS_TIMEOUT = 3    # seconds per folder access check
+FOLDER_LOADING_TIMEOUT = 60  # seconds - total time to load a profile (increased from 10)
+FOLDER_ACCESS_TIMEOUT = 10   # seconds per folder access check (increased from 3)
 
+# Note: The monitor also provides an additional 30-second grace period for loading
+# For local folders, access checks are optimized to be much faster
 # You can adjust these values:
 # - Increase FOLDER_LOADING_TIMEOUT if you have very large projects
 # - Increase FOLDER_ACCESS_TIMEOUT if you have slow network connections
@@ -404,8 +406,8 @@ class FolderMonitorApp:
         # Set the profile dropdown to the loaded profile
         self.profile_var.set(self.current_profile)
         
-        # Load settings with timeout handling
-        self.load_settings_with_timeout()
+        # Load settings - try simple load first, only use timeout system if needed
+        self.load_settings_smart()
         self.refresh_prompts_listbox()
         
         # NOW update current theme based on the loaded settings
@@ -1245,6 +1247,15 @@ class FolderMonitorApp:
     def check_folder_access_with_timeout(self, folder_path):
         """Check if a folder is accessible within a timeout period."""
         try:
+            # For local paths, do a quicker check
+            if not self.is_potentially_problematic_path(folder_path):
+                # Simple existence check for local paths
+                try:
+                    return os.path.exists(folder_path) and os.path.isdir(folder_path)
+                except:
+                    return False
+            
+            # For potentially problematic paths, use the timeout approach
             if os.name == 'nt':  # Windows
                 result_queue = queue.Queue()
                 
@@ -1253,7 +1264,18 @@ class FolderMonitorApp:
                         exists = os.path.exists(folder_path)
                         if exists:
                             # Try to list directory to ensure it's actually accessible
-                            os.listdir(folder_path)
+                            # But limit the listing to avoid hanging on huge directories
+                            try:
+                                items = os.listdir(folder_path)
+                                # Just check if we can get at least one item, don't load all
+                                if len(items) > 100:
+                                    # For large directories, just check the first few items
+                                    for i, item in enumerate(items):
+                                        if i >= 5:  # Only check first 5 items
+                                            break
+                                        os.path.join(folder_path, item)  # Quick access test
+                            except:
+                                pass  # If listing fails, still return True if folder exists
                         result_queue.put(exists)
                     except Exception as e:
                         result_queue.put(False)
@@ -1271,7 +1293,16 @@ class FolderMonitorApp:
             else:  # Unix-like systems
                 with FolderLoadingTimeout(FOLDER_ACCESS_TIMEOUT):
                     if os.path.exists(folder_path):
-                        os.listdir(folder_path)  # Test actual access
+                        # Light access test - don't fully enumerate large directories
+                        try:
+                            items = os.listdir(folder_path)
+                            # Quick test on just a few items
+                            for i, item in enumerate(items):
+                                if i >= 5:
+                                    break
+                                os.path.join(folder_path, item)
+                        except:
+                            pass  # Still return True if basic existence check passed
                         return True
                     return False
                     
@@ -1282,9 +1313,14 @@ class FolderMonitorApp:
     def add_directory_contents(self, directory_path, parent_id):
         """Add directory contents with timeout handling."""
         try:
-            # Check access with timeout before proceeding
-            if not self.check_folder_access_with_timeout(directory_path):
-                return
+            # For local paths, do a lightweight check, for network paths use full timeout check
+            if self.is_potentially_problematic_path(directory_path):
+                if not self.check_folder_access_with_timeout(directory_path):
+                    return
+            else:
+                # Quick check for local paths - just verify it exists and is accessible
+                if not (os.path.exists(directory_path) and os.path.isdir(directory_path)):
+                    return
                 
             items = sorted(os.listdir(directory_path))
         except (PermissionError, OSError, IOError) as e:
@@ -1466,9 +1502,14 @@ class FolderMonitorApp:
             if self.loading_dialog and self.loading_dialog.is_cancelled():
                 return
                 
-            # Check access with timeout before proceeding
-            if not self.check_folder_access_with_timeout(directory_path):
-                return
+            # For local paths, do a lightweight check, for network paths use full timeout check
+            if self.is_potentially_problematic_path(directory_path):
+                if not self.check_folder_access_with_timeout(directory_path):
+                    return
+            else:
+                # Quick check for local paths - just verify it exists and is accessible
+                if not (os.path.exists(directory_path) and os.path.isdir(directory_path)):
+                    return
                 
             items = sorted(os.listdir(directory_path))
         except (PermissionError, OSError, IOError) as e:
@@ -1543,9 +1584,14 @@ class FolderMonitorApp:
             if cancel_flag.is_set():
                 return
                 
-            # Check access with timeout before proceeding
-            if not self.check_folder_access_with_timeout(directory_path):
-                return
+            # For local paths, do a lightweight check, for network paths use full timeout check
+            if self.is_potentially_problematic_path(directory_path):
+                if not self.check_folder_access_with_timeout(directory_path):
+                    return
+            else:
+                # Quick check for local paths - just verify it exists and is accessible
+                if not (os.path.exists(directory_path) and os.path.isdir(directory_path)):
+                    return
                 
             items = sorted(os.listdir(directory_path))
         except (PermissionError, OSError, IOError) as e:
@@ -1630,12 +1676,16 @@ class FolderMonitorApp:
 
     def apply_saved_checks(self):
         """Apply saved check states from config, respecting filters."""
+        # Keep track of applied checks for verification
+        applied_checks = {}
+        
         for path, checked in self.saved_folder_checks.items():
             # Only apply checks to paths that:
             # 1. Exist in the folder tree data
             # 2. Are not filtered out by ignore patterns
             if path in self.folder_tree_data and not self.filters_match(path):
                 self.folder_tree_data[path]['checked'] = checked
+                applied_checks[path] = checked
                 item_id = self.tree_ids_map.get(path)
                 if item_id:
                     text = self.tree.item(item_id, 'text')
@@ -1644,12 +1694,44 @@ class FolderMonitorApp:
                     elif not checked and text.startswith("[x] "):
                         self.tree.item(item_id, text=text.replace("[x] ", "", 1))
         
-        # Clear saved checks after applying
-        self.saved_folder_checks = {}
+        # Don't clear saved_folder_checks immediately - keep them for potential re-application
+        # as the tree continues to build. We'll schedule a delayed clear instead.
         
         # Update button count and automatically expand tree to show selected items
         self.update_show_selected_button()
-        self.master.after(100, self.expand_to_show_selected)  # Small delay to ensure tree is fully built
+        
+        # Schedule delayed expansion and cleanup
+        self.master.after(100, self.expand_to_show_selected)
+        self.master.after(500, self._delayed_apply_remaining_checks)  # Check again after 500ms
+        self.master.after(2000, self._clear_saved_checks)  # Clear after 2 seconds
+    
+    def _delayed_apply_remaining_checks(self):
+        """Apply any remaining saved checks that weren't applied initially."""
+        remaining_checks = {}
+        for path, checked in self.saved_folder_checks.items():
+            if path not in self.folder_tree_data:
+                remaining_checks[path] = checked
+            elif path in self.folder_tree_data and self.folder_tree_data[path].get('checked', False) != checked:
+                # Re-apply the check if it doesn't match
+                if not self.filters_match(path):
+                    self.folder_tree_data[path]['checked'] = checked
+                    item_id = self.tree_ids_map.get(path)
+                    if item_id:
+                        text = self.tree.item(item_id, 'text')
+                        if checked and not text.startswith("[x] "):
+                            self.tree.item(item_id, text="[x] " + text)
+                        elif not checked and text.startswith("[x] "):
+                            self.tree.item(item_id, text=text.replace("[x] ", "", 1))
+        
+        if remaining_checks:
+            print(f"Applied {len(remaining_checks)} additional saved checks")
+            self.update_show_selected_button()
+    
+    def _clear_saved_checks(self):
+        """Clear the saved folder checks after giving enough time for tree building."""
+        if self.saved_folder_checks:
+            print(f"Clearing {len(self.saved_folder_checks)} saved checks")
+        self.saved_folder_checks = {}
 
     # -----------------------------------------------------------------------
     #  IGNORE PATTERNS
@@ -2078,15 +2160,40 @@ class FolderMonitorApp:
                 # Convert path to Windows format if needed
                 windows_path = temp_file.name.replace('/', '\\')
                 
-                # PowerShell command to copy file to clipboard
-                ps_command = f'Set-Clipboard -Path "{windows_path}"'
-                subprocess.run(['powershell', '-Command', ps_command], 
-                             check=True, capture_output=True, text=True)
-                
-            except subprocess.CalledProcessError as e:
-                # Fallback: copy file path as text if PowerShell method fails
-                self.master.clipboard_clear()
-                self.master.clipboard_append(temp_file.name)
+                # Determine which PowerShell executable is available
+                # Try "powershell" first (Windows PowerShell), then "pwsh" (PowerShell Core)
+                ps_executables = [
+                    "powershell",  # Windows PowerShell if already in PATH
+                    "powershell.exe",
+                    r"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",  # Default Win PS path
+                    "pwsh",  # PowerShell Core (as last resort)
+                    "pwsh.exe"
+                ]
+                ps_exe = None
+                for exe in ps_executables:
+                    if shutil.which(exe):
+                        ps_exe = exe
+                        break
+
+                if ps_exe:
+                    # Use -LiteralPath to avoid wildcard expansion
+                    ps_command = f'Set-Clipboard -LiteralPath \"{windows_path}\"'
+
+                    # Use -NoProfile for faster startup and to avoid user profile side effects
+                    subprocess.run([ps_exe, '-NoProfile', '-Command', ps_command], 
+                                   check=True, capture_output=True, text=True)
+                    print(f"Copied file to clipboard using {ps_exe}")
+                else:
+                    raise FileNotFoundError("No compatible Windows PowerShell executable found for Set-Clipboard")
+
+            except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+                print(f"PowerShell file copy failed: {e} - falling back to copying path as text")
+                # Fallback: copy file path as plain text if PowerShell method fails
+                try:
+                    self.master.clipboard_clear()
+                    self.master.clipboard_append(temp_file.name)
+                except Exception as clip_e:
+                    print(f"Clipboard fallback failed: {clip_e}")
             
             # Check if this content is identical to the most recent history item
             is_duplicate = False
@@ -2499,6 +2606,49 @@ class FolderMonitorApp:
             return True
             
         return False
+    
+    def load_settings_smart(self):
+        """Smart loading that tries simple load first for local folders, then falls back to timeout system."""
+        original_profile = self.current_profile
+        
+        # First, try to determine if we have mostly local folders
+        try:
+            if self.current_profile == "default":
+                config_path = CONFIG_FILE
+            else:
+                config_path = os.path.join(PROFILES_DIR, f"{self.current_profile}.json")
+            
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                root_folders = data.get("root_folders", [])
+                
+                # Check if most folders are local (not problematic)
+                local_folders = []
+                problematic_folders = []
+                for folder in root_folders:
+                    if self.is_potentially_problematic_path(folder):
+                        problematic_folders.append(folder)
+                    else:
+                        local_folders.append(folder)
+                
+                # If most folders are local, try a direct load first
+                if len(local_folders) >= len(problematic_folders):
+                    print(f"Profile has {len(local_folders)} local folders vs {len(problematic_folders)} network folders - trying direct load")
+                    try:
+                        # Try direct load for profiles with mostly local folders
+                        self.load_settings()
+                        print("Direct load successful!")
+                        return
+                    except Exception as e:
+                        print(f"Direct load failed: {e}, falling back to timeout system")
+                
+        except Exception as e:
+            print(f"Error checking profile: {e}")
+        
+        # Fall back to timeout system
+        print("Using timeout-based loading system")
+        self.load_settings_with_timeout()
     
     def load_settings_with_timeout(self):
         """Load settings with timeout handling and fallback mechanisms."""
@@ -3714,6 +3864,8 @@ class FolderMonitorApp:
         # First unregister any existing hotkey
         if self.hotkey_registered:
             self.unregister_global_hotkey()
+            # Wait a bit more for complete cleanup
+            time.sleep(0.2)
             
         if self.prepend_hotkey_enabled.get():
             def on_hotkey_press():
@@ -3721,13 +3873,21 @@ class FolderMonitorApp:
                     # Get clipboard content
                     content = self.master.clipboard_get()
                     
-                    # Check if content already starts with the prepend string
-                    if content.lstrip().startswith(self.prepend_string):
+                    # More robust check for prepend string - handle various whitespace scenarios
+                    content_stripped = content.strip()
+                    prepend_stripped = self.prepend_string.strip()
+                    
+                    # Check if content already starts with the prepend string (with flexible whitespace handling)
+                    if content_stripped.startswith(prepend_stripped) or (prepend_stripped in content_stripped[:len(prepend_stripped) + 10]):
+                        print("Content already contains prepend string, performing direct paste")
                         # Content already has the prepend string, just simulate paste
                         time.sleep(0.1)
                         # Release all keys from the hotkey combination
                         for key in self.hotkey_combination.split('+'):
-                            keyboard.release(key.strip())
+                            try:
+                                keyboard.release(key.strip())
+                            except:
+                                pass  # Ignore release errors
                         time.sleep(0.1)
                         keyboard.press('ctrl')
                         keyboard.press('v')
@@ -3736,26 +3896,55 @@ class FolderMonitorApp:
                         keyboard.release('ctrl')
                         return
                     
+                    print(f"Prepending text: '{self.prepend_string[:30]}...' to clipboard content")
                     # Prepend string and two newlines
                     new_content = f"{self.prepend_string}\n\n{content}"
-                    # Set clipboard
-                    self.master.clipboard_clear()
-                    self.master.clipboard_append(new_content)
+                    
+                    # Set clipboard with retry logic
+                    for attempt in range(3):
+                        try:
+                            self.master.clipboard_clear()
+                            self.master.clipboard_append(new_content)
+                            # Verify clipboard was set correctly
+                            test_content = self.master.clipboard_get()
+                            if test_content == new_content:
+                                break
+                        except Exception as clip_e:
+                            print(f"Clipboard set attempt {attempt + 1} failed: {clip_e}")
+                            if attempt == 2:
+                                raise clip_e
+                            time.sleep(0.05)
+                    
                     # Give a small delay to ensure clipboard is updated
                     time.sleep(0.1)
+                    
                     # Release the original hotkey combination to avoid interference
                     for key in self.hotkey_combination.split('+'):
-                        keyboard.release(key.strip())
+                        try:
+                            keyboard.release(key.strip())
+                        except:
+                            pass  # Ignore release errors
+                    
                     # Small delay before paste
                     time.sleep(0.1)
+                    
                     # Simulate paste using just Ctrl+V
                     keyboard.press('ctrl')
                     keyboard.press('v')
                     time.sleep(0.1)
                     keyboard.release('v')
                     keyboard.release('ctrl')
+                    
+                    print("Prepend and paste completed successfully")
+                    
                 except Exception as e:
                     print(f"Hotkey error: {e}")
+                    # Try to release any stuck keys
+                    try:
+                        for key in ['ctrl', 'alt', 'shift', 'win', 'v']:
+                            keyboard.release(key)
+                    except:
+                        pass
             
             def on_hotkey_release():
                 # We don't need to do anything on release
@@ -3766,16 +3955,30 @@ class FolderMonitorApp:
                 try:
                     # Convert our format to the library's expected format
                     hotkey_str = self.hotkey_combination.replace('ctrl', 'control').replace('+', ' + ')
+                    print(f"Registering hotkey: {hotkey_str}")
+                    
+                    # Clear any previous registrations that might be stuck
+                    try:
+                        stop_checking_hotkeys()
+                        time.sleep(0.1)
+                    except:
+                        pass  # Ignore if nothing was registered
+                    
                     register_hotkey(hotkey_str, on_hotkey_press, on_hotkey_release)
                     start_checking_hotkeys()
                     self.hotkey_registered = True
+                    print(f"Hotkey {hotkey_str} registered successfully")
+                    
+                    # Test the hotkey registration by checking if the system acknowledges it
+                    time.sleep(0.1)
+                    
                     # Update status on main thread
                     self.master.after(0, lambda: self.update_hotkey_status("Active", "green"))
                 except Exception as e:
                     print(f"Hotkey registration error: {e}")
                     self.hotkey_registered = False
                     # Update status on main thread
-                    self.master.after(0, lambda: self.update_hotkey_status(f"Error: {str(e)}", "red"))
+                    self.master.after(0, lambda: self.update_hotkey_status(f"Error: {str(e)[:30]}", "red"))
                     
             self.hotkey_thread = threading.Thread(target=hotkey_thread_func, daemon=True)
             self.hotkey_thread.start()
@@ -3786,11 +3989,31 @@ class FolderMonitorApp:
         """Unregister the global hotkey with proper cleanup."""
         if self.hotkey_registered:
             try:
+                # Force stop and cleanup
                 stop_checking_hotkeys()
+                
+                # Wait a moment for the library to properly release the hotkeys
+                time.sleep(0.1)
+                
+                # Clear any held keyboard states using the keyboard library
+                try:
+                    # Release all possible modifier keys that might be stuck
+                    for key in ['ctrl', 'alt', 'shift', 'win']:
+                        keyboard.release(key)
+                except:
+                    pass  # Ignore errors when releasing keys that weren't pressed
+                
                 self.hotkey_registered = False
                 self.update_hotkey_status("", "")
+                print("Hotkey successfully unregistered and keys released")
             except Exception as e:
                 print(f"Error unregistering hotkey: {e}")
+                # Force cleanup even if error occurred
+                try:
+                    for key in ['ctrl', 'alt', 'shift', 'win']:
+                        keyboard.release(key)
+                except:
+                    pass
                 self.hotkey_registered = False
                 
     def update_hotkey_status(self, text, color):
@@ -4057,15 +4280,31 @@ Recommended combinations:
             # Save current profile as last used
             self.save_last_profile(self.current_profile)
             
-            # Cleanup hotkeys
-            if self.hotkey_registered:
+            # Cleanup hotkeys with extra safety
+            if hasattr(self, 'hotkey_registered') and self.hotkey_registered:
+                print("Cleaning up hotkeys on window close...")
                 self.unregister_global_hotkey()
+                # Extra safety - force release any potentially stuck keys
+                try:
+                    for key in ['ctrl', 'alt', 'shift', 'win']:
+                        keyboard.release(key)
+                except:
+                    pass
+                # Wait a moment for complete cleanup
+                time.sleep(0.1)
                 
             # Destroy the window
             self.master.destroy()
         except Exception as e:
             print(f"Error during window close: {e}")
-            # Force close even if there's an error
+            # Force close even if there's an error - but still try hotkey cleanup
+            try:
+                if hasattr(self, 'hotkey_registered') and self.hotkey_registered:
+                    stop_checking_hotkeys()
+                    for key in ['ctrl', 'alt', 'shift', 'win']:
+                        keyboard.release(key)
+            except:
+                pass
             self.master.destroy()
 
     def _monitor_thread_non_blocking(self, thread, start_time, timeout_seconds, cancel_flag, exception_queue, result_queue, on_success, on_error):
@@ -4082,12 +4321,19 @@ Recommended combinations:
                 elif cancel_type == "disable_timeouts":
                     timeout_seconds = None  # Disable further timeout checks
             
-            # Check timeout
-            if timeout_seconds is not None and (time.time() - start_time) > timeout_seconds:
-                cancel_flag.set()
-                if on_error:
-                    on_error(TimeoutError(f"Loading timed out after {timeout_seconds} seconds"))
-                return
+            # Check timeout with more generous handling
+            elapsed_time = time.time() - start_time
+            if timeout_seconds is not None and elapsed_time > timeout_seconds:
+                # Give extra time for local folders (be more generous)
+                if elapsed_time < timeout_seconds + 30:  # Extra 30 seconds grace period
+                    if self.loading_dialog:
+                        remaining = int((timeout_seconds + 30) - elapsed_time)
+                        self.loading_dialog.update_status(f"Taking longer than expected... {remaining}s remaining", "orange")
+                else:
+                    cancel_flag.set()
+                    if on_error:
+                        on_error(TimeoutError(f"Loading timed out after {timeout_seconds + 30} seconds (with grace period)"))
+                    return
             
             # Continue polling
             self.master.after(100, lambda: self._monitor_thread_non_blocking(thread, start_time, timeout_seconds, cancel_flag, exception_queue, result_queue, on_success, on_error))
