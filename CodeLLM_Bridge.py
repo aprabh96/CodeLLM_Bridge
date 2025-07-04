@@ -3,7 +3,7 @@ import json
 import time
 import fnmatch
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter.scrolledtext import ScrolledText
 import datetime
 import shutil
@@ -374,6 +374,9 @@ class FolderMonitorApp:
 
         # We keep the saved check states from config
         self.saved_folder_checks = {}
+        
+        # Selection presets for saving/loading different selection combinations
+        self.selection_presets = {}
 
         # Checkbox for copying entire file tree
         self.copy_entire_tree_var = tk.BooleanVar(value=False)
@@ -475,6 +478,24 @@ class FolderMonitorApp:
                                              variable=self.dark_mode, 
                                              command=self.on_dark_mode_toggle)
         self.dark_mode_check.pack(side=tk.RIGHT, padx=5)
+
+        # Selection Presets Frame
+        presets_frame = tk.Frame(main_container)
+        presets_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        tk.Label(presets_frame, text="Selection Presets:").pack(side=tk.LEFT, padx=5)
+        self.preset_var = tk.StringVar()
+        self.preset_combo = ttk.Combobox(presets_frame, textvariable=self.preset_var, width=20)
+        self.preset_combo.pack(side=tk.LEFT, padx=5)
+
+        btn_save_preset = tk.Button(presets_frame, text="Save Selection", command=self.on_save_selection_preset)
+        btn_save_preset.pack(side=tk.LEFT, padx=5)
+
+        btn_load_preset = tk.Button(presets_frame, text="Load Selection", command=self.on_load_selection_preset)
+        btn_load_preset.pack(side=tk.LEFT, padx=5)
+
+        btn_delete_preset = tk.Button(presets_frame, text="Delete Preset", command=self.on_delete_selection_preset)
+        btn_delete_preset.pack(side=tk.LEFT, padx=5)
 
         # Refresh Button Frame
         refresh_frame = tk.Frame(main_container)
@@ -2408,6 +2429,7 @@ class FolderMonitorApp:
                         "prepend_hotkey_enabled": self.prepend_hotkey_enabled.get(),
                         "hotkey_combination": self.hotkey_combination,
                         "enable_timeouts": self.enable_timeouts.get(),
+                        "selection_presets": getattr(self, 'selection_presets', {}),
                     }
                     for path, info in self.folder_tree_data.items():
                         data["folder_checks"][path] = info['checked']
@@ -2471,6 +2493,7 @@ class FolderMonitorApp:
                 self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
                 self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
                 self.enable_timeouts.set(data.get("enable_timeouts", True))
+                self.selection_presets = data.get("selection_presets", {})
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
         
@@ -2492,6 +2515,9 @@ class FolderMonitorApp:
         
         # Load history for this profile
         self.load_history()
+        
+        # Update preset combo box
+        self.update_preset_combo()
 
         if hasattr(self, 'prepend_entry'):
             self.prepend_entry.delete(0, tk.END)
@@ -2945,6 +2971,7 @@ class FolderMonitorApp:
                 self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
                 self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
                 self.enable_timeouts.set(data.get("enable_timeouts", True))
+                self.selection_presets = data.get("selection_presets", {})
             except Exception as e:
                 self.master.after_idle(lambda: messagebox.showerror("Error Loading Settings", str(e)))
         
@@ -2979,6 +3006,9 @@ class FolderMonitorApp:
             
             # Load history for this profile
             self.load_history()
+            
+            # Update preset combo box
+            self.update_preset_combo()
 
             if hasattr(self, 'prepend_entry'):
                 self.prepend_entry.delete(0, tk.END)
@@ -3059,6 +3089,7 @@ class FolderMonitorApp:
                 self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
                 self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
                 self.enable_timeouts.set(data.get("enable_timeouts", True))
+                self.selection_presets = data.get("selection_presets", {})
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
         
@@ -3426,6 +3457,7 @@ class FolderMonitorApp:
             "prepend_hotkey_enabled": self.prepend_hotkey_enabled.get(),
             "hotkey_combination": self.hotkey_combination,
             "enable_timeouts": self.enable_timeouts.get(),
+            "selection_presets": getattr(self, 'selection_presets', {}),
         }
         for path, info in self.folder_tree_data.items():
             data["folder_checks"][path] = info['checked']
@@ -3436,6 +3468,173 @@ class FolderMonitorApp:
                 json.dump(data, f, indent=2)
         except Exception as e:
             messagebox.showerror("Error Saving Profile", str(e))
+
+    def save_selection_preset(self, preset_name, description=""):
+        """Save current selection state as a preset."""
+        current_selections = {}
+        for path, info in self.folder_tree_data.items():
+            if info['checked']:
+                current_selections[path] = True
+        
+        self.selection_presets[preset_name] = {
+            "folder_checks": current_selections,
+            "description": description,
+            "created_date": datetime.datetime.now().isoformat(),
+            "last_used": datetime.datetime.now().isoformat()
+        }
+        
+        # Save to current profile
+        self.save_settings()
+        self.set_status(f"✓ Selection preset '{preset_name}' saved")
+
+    def load_selection_preset(self, preset_name):
+        """Load a selection preset."""
+        if preset_name not in self.selection_presets:
+            self.set_status(f"❌ Selection preset '{preset_name}' not found")
+            return False
+        
+        preset = self.selection_presets[preset_name]
+        
+        # Clear all current selections
+        for path in self.folder_tree_data:
+            self.folder_tree_data[path]['checked'] = False
+        
+        # Apply preset selections
+        for path, checked in preset["folder_checks"].items():
+            if path in self.folder_tree_data:
+                self.folder_tree_data[path]['checked'] = checked
+        
+        # Update the tree view to reflect the changes
+        self.update_tree_display()
+        
+        # Expand all parent folders of selected items to make them visible
+        self.expand_to_selected_items()
+        
+        # Update last used timestamp
+        self.selection_presets[preset_name]["last_used"] = datetime.datetime.now().isoformat()
+        
+        # Save to current profile
+        self.save_settings()
+        self.set_status(f"✓ Selection preset '{preset_name}' loaded")
+        return True
+
+    def delete_selection_preset(self, preset_name):
+        """Delete a selection preset."""
+        if preset_name in self.selection_presets:
+            del self.selection_presets[preset_name]
+            self.save_settings()
+            self.set_status(f"✓ Selection preset '{preset_name}' deleted")
+            return True
+        return False
+
+    def get_selection_presets(self):
+        """Get list of available selection presets."""
+        return list(self.selection_presets.keys())
+
+    def update_tree_display(self):
+        """Update the tree view to reflect current folder_tree_data checked states."""
+        for path, info in self.folder_tree_data.items():
+            item_id = self.tree_ids_map.get(path)
+            if item_id:
+                text = self.tree.item(item_id, 'text')
+                if info['checked'] and not text.startswith("[x] "):
+                    self.tree.item(item_id, text="[x] " + text)
+                elif not info['checked'] and text.startswith("[x] "):
+                    self.tree.item(item_id, text=text.replace("[x] ", "", 1))
+
+    def expand_to_selected_items(self):
+        """Expand all parent folders of selected items to make them visible."""
+        selected_paths = []
+        expanded_count = 0
+        
+        # Collect all selected paths
+        for path, info in self.folder_tree_data.items():
+            if info['checked']:
+                selected_paths.append(path)
+        
+        # For each selected path, expand all its parent directories
+        paths_to_expand = set()
+        for path in selected_paths:
+            # Add all parent directories to the expansion set
+            current_path = path
+            while current_path:
+                parent_path = os.path.dirname(current_path)
+                if parent_path and parent_path != current_path:
+                    paths_to_expand.add(parent_path)
+                    current_path = parent_path
+                else:
+                    break
+        
+        # Also add the selected paths themselves if they are directories
+        for path in selected_paths:
+            if path in self.folder_tree_data and self.folder_tree_data[path]['is_dir']:
+                paths_to_expand.add(path)
+        
+        # Expand all the collected paths
+        for path in paths_to_expand:
+            if path in self.tree_ids_map:
+                tree_id = self.tree_ids_map[path]
+                if self.tree.exists(tree_id):
+                    if not self.tree.item(tree_id, 'open'):
+                        self.tree.item(tree_id, open=True)
+                        expanded_count += 1
+        
+        # Scroll to the first selected item to make it visible
+        if selected_paths:
+            # Sort selected paths to find the "first" one (alphabetically)
+            first_selected = sorted(selected_paths)[0]
+            if first_selected in self.tree_ids_map:
+                tree_id = self.tree_ids_map[first_selected]
+                if self.tree.exists(tree_id):
+                    self.tree.see(tree_id)
+        
+        if expanded_count > 0:
+            self.set_status(f"✓ Expanded {expanded_count} folders to show selected items")
+
+    def on_save_selection_preset(self):
+        """Handle saving current selection as a preset."""
+        preset_name = tk.simpledialog.askstring("Save Selection Preset", "Enter a name for this selection preset:")
+        if preset_name:
+            if preset_name in self.selection_presets:
+                if not messagebox.askyesno("Overwrite Preset", f"A preset named '{preset_name}' already exists. Overwrite it?"):
+                    return
+            
+            description = tk.simpledialog.askstring("Preset Description", "Enter a description (optional):", initialvalue="")
+            self.save_selection_preset(preset_name, description or "")
+            self.update_preset_combo()
+
+    def on_load_selection_preset(self):
+        """Handle loading a selection preset."""
+        preset_name = self.preset_var.get()
+        if not preset_name:
+            messagebox.showwarning("No Selection", "Please select a preset from the dropdown.")
+            return
+        
+        if preset_name in self.selection_presets:
+            self.load_selection_preset(preset_name)
+        else:
+            messagebox.showerror("Preset Not Found", f"Selection preset '{preset_name}' not found.")
+
+    def on_delete_selection_preset(self):
+        """Handle deleting a selection preset."""
+        preset_name = self.preset_var.get()
+        if not preset_name:
+            messagebox.showwarning("No Selection", "Please select a preset from the dropdown.")
+            return
+        
+        if preset_name in self.selection_presets:
+            if messagebox.askyesno("Delete Preset", f"Are you sure you want to delete the preset '{preset_name}'?"):
+                self.delete_selection_preset(preset_name)
+                self.update_preset_combo()
+                self.preset_var.set("")
+        else:
+            messagebox.showerror("Preset Not Found", f"Selection preset '{preset_name}' not found.")
+
+    def update_preset_combo(self):
+        """Update the preset combo box with current presets."""
+        if hasattr(self, 'preset_combo'):
+            presets = self.get_selection_presets()
+            self.preset_combo['values'] = presets
 
     def on_toggle_system_filter(self):
         """Rebuild tree when system filter is toggled."""
