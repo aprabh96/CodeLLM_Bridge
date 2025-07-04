@@ -504,6 +504,9 @@ class FolderMonitorApp:
         btn_refresh = tk.Button(refresh_frame, text="Refresh Folders", command=self.on_refresh_folders)
         btn_refresh.pack(side=tk.LEFT, padx=5)
 
+        btn_reduce_tokens = tk.Button(refresh_frame, text="Reduce Tokens", command=self.on_reduce_tokens, bg="#4CAF50", fg="white")
+        btn_reduce_tokens.pack(side=tk.LEFT, padx=5)
+
         # System Folder Filter Checkbox
         chk_system_filter = tk.Checkbutton(
             refresh_frame, 
@@ -3635,6 +3638,250 @@ class FolderMonitorApp:
         if hasattr(self, 'preset_combo'):
             presets = self.get_selection_presets()
             self.preset_combo['values'] = presets
+
+    def on_reduce_tokens(self):
+        """Open the token reduction helper dialog."""
+        self.open_token_reduction_dialog()
+
+    def open_token_reduction_dialog(self):
+        """Create and show the token reduction helper dialog."""
+        dialog = tk.Toplevel(self.master)
+        dialog.title("Token Reduction Helper")
+        dialog.geometry("700x500")
+        dialog.resizable(True, True)
+        
+        # Make dialog modal
+        dialog.transient(self.master)
+        dialog.grab_set()
+        
+        # Center the dialog on parent
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (700 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (500 // 2)
+        dialog.geometry(f"700x500+{x}+{y}")
+        
+        # Main frame
+        main_frame = tk.Frame(dialog, padx=20, pady=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Title
+        title_label = tk.Label(main_frame, text="Reduce Tokens with AI File Analysis", 
+                              font=("Arial", 16, "bold"))
+        title_label.pack(pady=(0, 20))
+        
+        # Instructions section
+        instructions_frame = tk.LabelFrame(main_frame, text="Step 1: Get JSON Format Instructions", padx=10, pady=10)
+        instructions_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        inst_text = tk.Label(instructions_frame, 
+                           text="Use Cursor AI, Windsurf AI, or similar tools to analyze your codebase.\nClick below to copy the JSON format instructions:", 
+                           justify=tk.LEFT, wraplength=600)
+        inst_text.pack(pady=(0, 10))
+        
+        btn_copy_instructions = tk.Button(instructions_frame, text="📋 Copy JSON Format Instructions", 
+                                        command=lambda: self.copy_ai_instructions(dialog),
+                                        bg="#2196F3", fg="white", font=("Arial", 11, "bold"))
+        btn_copy_instructions.pack(pady=5)
+        
+        # JSON import section
+        import_frame = tk.LabelFrame(main_frame, text="Step 2: Import AI's JSON Response", padx=10, pady=10)
+        import_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+        
+        import_text = tk.Label(import_frame, 
+                             text="After AI analyzes your code and responds with JSON file list, import it below:", 
+                             justify=tk.LEFT, wraplength=600)
+        import_text.pack(pady=(0, 10))
+        
+        btn_import_json = tk.Button(import_frame, text="📥 Import JSON from Clipboard", 
+                                  command=lambda: self.import_json_selection(dialog),
+                                  bg="#FF9800", fg="white", font=("Arial", 11, "bold"))
+        btn_import_json.pack(pady=5)
+        
+        # Text area for manual JSON entry (optional)
+        manual_frame = tk.Frame(import_frame)
+        manual_frame.pack(fill=tk.BOTH, expand=True, pady=(15, 0))
+        
+        tk.Label(manual_frame, text="Or paste JSON here manually:", font=("Arial", 10)).pack(anchor=tk.W)
+        
+        json_text_frame = tk.Frame(manual_frame)
+        json_text_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        
+        self.json_text = ScrolledText(json_text_frame, height=8, font=("Consolas", 10))
+        self.json_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Manual import button
+        btn_manual_import = tk.Button(manual_frame, text="Import from Text Above", 
+                                    command=lambda: self.import_json_from_text(dialog),
+                                    bg="#4CAF50", fg="white")
+        btn_manual_import.pack(pady=(10, 0))
+        
+        # Close button
+        close_frame = tk.Frame(main_frame)
+        close_frame.pack(fill=tk.X, pady=(15, 0))
+        
+        btn_close = tk.Button(close_frame, text="Close", command=dialog.destroy)
+        btn_close.pack(side=tk.RIGHT)
+
+    def copy_ai_instructions(self, dialog):
+        """Generate and copy AI analysis instructions to clipboard."""
+        # Get user instructions from the main window
+        user_request = self.user_instructions.strip() if self.user_instructions.strip() else "[No specific request provided - please describe what you want to implement]"
+        
+        # Generate complete instructions including user request
+        instructions = f"""{user_request}
+
+IMPORTANT: DO NOT make any code changes or modifications. I only need you to analyze the codebase and tell me which specific files I should select for this request.
+
+Please analyze my codebase and determine the minimum essential files needed for the above request. Use tools like Cursor AI or Windsurf AI to examine the project structure.
+
+Respond with ONLY a JSON object in this exact format:
+{{
+  "files": [
+    "src/components/Header.tsx",
+    "src/utils/api.js", 
+    "package.json",
+    "src/styles/main.css"
+  ],
+  "reasoning": "Brief explanation of why these files are essential for your request"
+}}
+
+Include only the files that need to be modified or are critical dependencies. Use file paths relative to the project root (the tool will automatically convert them to absolute paths). Remember: NO CODE CHANGES, just file selection analysis."""
+
+        try:
+            pyperclip.copy(instructions)
+            messagebox.showinfo("Instructions Copied!", 
+                              "Your request + JSON format instructions have been copied!\n\n"
+                              "Next steps:\n"
+                              "1. Open Cursor AI, Windsurf AI, or any AI coding assistant\n"
+                              "2. Paste the copied text (includes your request + format)\n"
+                              "3. Let the AI analyze your codebase (NO code changes will be made)\n"
+                              "4. Copy the AI's JSON response\n"
+                              "5. Come back and click 'Import JSON' below")
+        except Exception as e:
+            messagebox.showerror("Copy Error", f"Failed to copy to clipboard: {str(e)}")
+
+    def import_json_selection(self, dialog):
+        """Import file selection from clipboard JSON."""
+        try:
+            clipboard_content = pyperclip.paste()
+            self.process_json_selection(clipboard_content, dialog)
+        except Exception as e:
+            messagebox.showerror("Import Error", f"Failed to read from clipboard: {str(e)}")
+
+    def import_json_from_text(self, dialog):
+        """Import file selection from the text area."""
+        json_content = self.json_text.get("1.0", tk.END).strip()
+        if not json_content:
+            messagebox.showwarning("No Content", "Please paste JSON content in the text area first.")
+            return
+        self.process_json_selection(json_content, dialog)
+
+    def find_absolute_path(self, relative_path):
+        """Convert relative path to absolute path by matching against folder_tree_data."""
+        # Clean up the relative path
+        relative_path = relative_path.replace('\\', '/').strip('/')
+        
+        # Try exact matches first
+        for abs_path in self.folder_tree_data.keys():
+            abs_normalized = abs_path.replace('\\', '/')
+            if abs_normalized.endswith('/' + relative_path) or abs_normalized.endswith(relative_path):
+                return abs_path
+        
+        # Try matching by filename and partial path
+        relative_parts = [part for part in relative_path.split('/') if part]
+        
+        for abs_path in self.folder_tree_data.keys():
+            abs_parts = [part for part in abs_path.replace('\\', '/').split('/') if part]
+            
+            # Check if all relative parts appear in order at the end of absolute parts
+            if len(relative_parts) <= len(abs_parts):
+                if abs_parts[-len(relative_parts):] == relative_parts:
+                    return abs_path
+        
+        return None
+
+    def process_json_selection(self, json_content, dialog):
+        """Process the JSON content and apply file selection."""
+        try:
+            # Try to parse JSON
+            data = json.loads(json_content)
+            
+            # Validate JSON structure
+            if "files" not in data or not isinstance(data["files"], list):
+                messagebox.showerror("Invalid JSON", 
+                                   "JSON must contain a 'files' array.\n\n"
+                                   "Expected format:\n"
+                                   '{"files": ["path1", "path2"], "reasoning": "..."}')
+                return
+            
+            files_to_select = data["files"]
+            reasoning = data.get("reasoning", "No reasoning provided")
+            
+            # Clear all current selections
+            for path in self.folder_tree_data:
+                self.folder_tree_data[path]['checked'] = False
+            
+            # Apply new selections
+            selected_count = 0
+            missing_files = []
+            conversion_log = []
+            
+            for file_path in files_to_select:
+                # First try direct match (in case it's already absolute)
+                if file_path in self.folder_tree_data:
+                    self.folder_tree_data[file_path]['checked'] = True
+                    selected_count += 1
+                    conversion_log.append(f"✓ Direct: {file_path}")
+                else:
+                    # Try to convert relative to absolute
+                    absolute_path = self.find_absolute_path(file_path)
+                    if absolute_path:
+                        self.folder_tree_data[absolute_path]['checked'] = True
+                        selected_count += 1
+                        conversion_log.append(f"✓ Converted: {file_path} → {absolute_path}")
+                    else:
+                        missing_files.append(file_path)
+                        conversion_log.append(f"✗ Not found: {file_path}")
+            
+            # Update the tree display
+            self.update_tree_display()
+            self.expand_to_selected_items()
+            
+            # Show results
+            result_message = f"✅ Successfully selected {selected_count} files!\n\n"
+            if reasoning:
+                result_message += f"AI Reasoning: {reasoning}\n\n"
+            
+            # Show conversion details
+            if conversion_log:
+                result_message += "Path Conversion Log:\n"
+                for log_entry in conversion_log[:10]:  # Show first 10 entries
+                    result_message += f"{log_entry}\n"
+                if len(conversion_log) > 10:
+                    result_message += f"... and {len(conversion_log) - 10} more\n"
+                result_message += "\n"
+            
+            if missing_files:
+                result_message += f"⚠️ Warning: {len(missing_files)} files not found:\n"
+                for missing in missing_files[:5]:  # Show first 5 missing files
+                    result_message += f"- {missing}\n"
+                if len(missing_files) > 5:
+                    result_message += f"... and {len(missing_files) - 5} more"
+            
+            messagebox.showinfo("Import Successful", result_message)
+            
+            # Update status
+            self.set_status(f"✓ AI selection applied: {selected_count} files selected")
+            
+            # Close dialog
+            dialog.destroy()
+            
+        except json.JSONDecodeError as e:
+            messagebox.showerror("JSON Parse Error", 
+                               f"Invalid JSON format:\n{str(e)}\n\n"
+                               "Please ensure the content is valid JSON.")
+        except Exception as e:
+            messagebox.showerror("Processing Error", f"Error processing selection: {str(e)}")
 
     def on_toggle_system_filter(self):
         """Rebuild tree when system filter is toggled."""
