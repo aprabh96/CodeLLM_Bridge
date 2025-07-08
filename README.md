@@ -132,6 +132,9 @@ This enhancement ensures CodeLLM Bridge starts reliably even when network folder
   - Provides a complete overview of your project organization
   - Helps AI models understand the context and relationships between files
   - Useful when you want to show the complete project structure without copying all file contents
+- **Comment Stripping**: Optionally remove comments from copied code blocks
+  - Programming language is detected automatically per file
+  - Reduces the number of tokens sent to the AI for analysis
 - **Temporary File Export**: Save content to a temporary file and copy the file to clipboard
   - Ideal for large codebases that exceed AI input field character limits
   - Creates timestamped temporary files that can be uploaded to AI tools
