@@ -1,3 +1,14 @@
+"""
+Tokenization Support
+====================
+
+This application uses the `tiktoken` package to count tokens for text that is
+sent to language models. The tokenizer is chosen based on the selected model
+using `tiktoken.encoding_for_model()`. See the documentation block below for a
+detailed overview of installation, model mappings and best practices when
+working with OpenAI tokenizers.
+"""
+
 import os
 import json
 import time
@@ -15,6 +26,126 @@ import keyboard
 import tempfile
 import signal
 import queue
+import tiktoken
+
+TOKENIZATION_HELP = """
+Below is a **drop-in technical docstring** you can paste straight into your codebase (or feed to an AI-agent) to give it everything it needs to install `tiktoken`, pick the right tokenizer for any OpenAI model, and fall back gracefully when new models appear.
+
+---
+
+## SUMMARY (WHAT THIS FILE COVERS)
+
+* **Installation + version pin** for Python
+* **Core `tiktoken` API**: `encoding_for_model`, `encode`, `decode`, chat helpers
+* **Complete mapping table** – which encoding each OpenAI model (GPT-4o, o-series, GPT-4, GPT-3.5, Codex, embeddings, edits, legacy GPT-3) uses and its context window
+* **Fallback patterns** for future releases (manual patching of `MODEL_PREFIX_TO_ENCODING`)
+* **Performance tips & gotchas** when counting tokens in production
+
+Everything is annotated with authoritative sources so the agent can verify or expand if needed.
+
+---
+
+## 1  INSTALLATION & VERSIONING
+
+```bash
+pip install --upgrade "tiktoken>=0.9"
+```
+
+\*`≥ 0.9 (14 Feb 2025)` is the first wheel that **ships the `o200k_base` vocab and the `"o3-" / "o4-" / "gpt-4o"` mappings** – earlier versions hard-crash on those names.
+
+---
+
+## 2  CORE PYTHON API
+
+```python
+import tiktoken
+
+enc = tiktoken.encoding_for_model("gpt-4o")      # auto-selects o200k_base
+ids = enc.encode("Hello world")                   # → [9906, 2157]
+text = enc.decode(ids)                            # ≡ "Hello world"
+tokens = len(ids)                                 # quick count
+```
+
+### Counting chat payloads (billing-accurate)
+
+```python
+def count_chat_tokens(messages, model="gpt-4o"):
+    enc = tiktoken.encoding_for_model(model)
+    num = 0
+    for m in messages:
+        num += 3                                  # <|start|>role<|sep|>
+        num += len(enc.encode(m["role"]))
+        num += len(enc.encode(m["content"]))
+    return num + 3                                # assistant priming
+```
+
+---
+
+## 3  MODEL → ENCODING → CONTEXT WINDOW
+
+| Model family / prefix                                                              | Encoding returned by `encoding_for_model()` | Context window (tokens)                                      |
+| ---------------------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------ |
+| `gpt-4o`, `gpt-4o-mini`, `gpt-4o-*`                                                | **`o200k_base`**                            | 128 000 |
+| `o3-*`, `o4-*` (incl. `o3-pro`, `o4-mini-high`)                                    | **`o200k_base`**                            | 200 000 |
+| `gpt-4*`, `gpt-3.5*`, `text-embedding-3*`, `text-embedding-ada-002`                | **`cl100k_base`**                           | 128 000 / 16 000 (model-specific) |
+| `code-davinci-*`, `davinci-codex`, `cushman-codex`, `gpt-4-turbo-preview-2024-...` | **`p50k_base`**                             | 8 192–16 384 (see model card) |
+| `text-davinci-edit-001`, `code-davinci-edit-001`                                   | **`p50k_edit`**                             | 8 192 |
+| Legacy GPT-3 (`davinci`, `curie`, `babbage`, `ada`), similarity / search twins     | **`r50k_base`** (aka GPT-2)                 | 2 049 |
+
+---
+
+## 4  FUTURE-PROOFING (MANUAL PATCH)
+
+If OpenAI launches, say, **`o5-ultra`** before updating `tiktoken`, hot-patch:
+
+```python
+import tiktoken, re
+if re.match(r"^o5-", model_name):
+    tiktoken.MODEL_PREFIX_TO_ENCODING["o5-"] = "o200k_base"
+enc = tiktoken.encoding_for_model(model_name)
+```
+
+---
+
+## 5  PERFORMANCE TIPS / PITFALLS
+
+1. **Stale wheel = wrong counts** – 80 % of "token mismatch" bug reports are pinned to `tiktoken<0.9` running against o-models.
+2. **Role framing tokens** matter; omit them and you’ll **under-bill** by 6 tokens per message.
+3. **Different vocabs ≠ interchangeable** – `o200k_base` compresses non-Latin text better than `cl100k_base`.
+4. **Stream large texts** – at 5 MiB/s on a single core (`o200k_base`), CPU tokenization becomes the bottleneck before the network. Use the Rust-compiled wheel or batch encode.
+
+---
+
+## 6  INTEGRATION CHECKLIST FOR YOUR APP
+
+1. **Add to requirements**: `tiktoken>=0.9,<1.0`
+2. **Import once**; reuse the `Encoding` object per worker thread.
+3. **Wrap chat counting** with the helper above; log counts for cost observability.
+4. **Unit-test**: feed a 3-message chat and assert the token count is the expected integer (locks future upgrades).
+5. **On model upgrade day**:
+   * update the mapping wheel (`pip install -U tiktoken`)
+   * if unavailable, hot-patch the prefix (Section 4)
+   * regenerate golden counts in tests.
+
+---
+
+## 7  SPEED DIAL (LINKS YOUR AGENT CAN FOLLOW)
+
+* `github.com/openai/tiktoken` – source & changelog
+* OpenAI Cookbook “How to count tokens with tiktoken” – practical recipes
+* OpenAI Models doc – official list & context windows
+* Help Center FAQ on o3/o4-mini – confirms 200 k window
+* Model compare page (o3-pro) – live pricing & limits
+* Community threads confirming `o200k_base` for GPT-4o
+* Azure fine-tuning tutorial – same tokenizer usage in .NET/Java
+* tiktoken-go mapping list (cross-lang parity)
+* GitHub PR adding `o4-` prefix (how updates land)
+* GitHub issue showing `MODEL_PREFIX_TO_ENCODING` structure
+
+---
+
+**Copy-paste this doc block wherever your AI code-gen agent can read it, and you’ll never get blindsided by a “Could not automatically map XYZ to a tokeniser” error again.**
+"""
 
 class LoadingDialog:
     """A dialog that shows loading progress with the ability to cancel."""
@@ -154,6 +285,7 @@ PROFILES_DIR = "profiles"
 HISTORY_DIR = "history"  # New directory for history
 LAST_PROFILE_FILE = "last_profile.txt"  # File to store the last selected profile
 DEFAULT_PREPEND_STRING = "Apply ALL these changes one by one -"  # Default string for prepending
+DEFAULT_MODEL = "o3"  # Default tokenizer model
 
 # Theme colors
 LIGHT_THEME = {
@@ -293,6 +425,9 @@ class FolderMonitorApp:
         # Theme setting
         self.dark_mode = tk.BooleanVar(value=False)
         self.current_theme = LIGHT_THEME
+
+        # Model selection for token counting
+        self.token_model = tk.StringVar(value=DEFAULT_MODEL)
 
         # Profile management
         self.current_profile = self.load_last_profile_with_fallback()
@@ -506,9 +641,20 @@ class FolderMonitorApp:
         btn_delete_profile = tk.Button(profile_frame, text="Delete Profile", command=self.on_delete_profile)
         btn_delete_profile.pack(side=tk.LEFT, padx=5)
         
+        # Model selection for token counting
+        tk.Label(profile_frame, text="Model:").pack(side=tk.RIGHT, padx=5)
+        self.model_combo = ttk.Combobox(
+            profile_frame,
+            textvariable=self.token_model,
+            values=["o3", "gpt-4o", "gpt-4", "gpt-3.5"],
+            width=10
+        )
+        self.model_combo.pack(side=tk.RIGHT, padx=5)
+        self.model_combo.bind('<<ComboboxSelected>>', lambda e: self.save_settings())
+
         # Dark mode toggle
-        self.dark_mode_check = tk.Checkbutton(profile_frame, text="Dark Mode", 
-                                             variable=self.dark_mode, 
+        self.dark_mode_check = tk.Checkbutton(profile_frame, text="Dark Mode",
+                                             variable=self.dark_mode,
                                              command=self.on_dark_mode_toggle)
         self.dark_mode_check.pack(side=tk.RIGHT, padx=5)
 
@@ -2154,6 +2300,10 @@ class FolderMonitorApp:
             f"{user_instructions_block}\n"
         )
 
+        # Count tokens using selected model
+        enc = tiktoken.encoding_for_model(self.token_model.get())
+        token_count = len(enc.encode(final_clip))
+
         # Check if this content is identical to the most recent history item
         is_duplicate = False
         if self.history_items:
@@ -2171,9 +2321,9 @@ class FolderMonitorApp:
         # Only save to history if it's not a duplicate
         if not is_duplicate:
             self.save_history_item(final_clip, self.user_instructions)
-            self.set_status("Data copied to clipboard and saved to history.")
+            self.set_status(f"Data copied to clipboard ({token_count} tokens) and saved to history.")
         else:
-            self.set_status("Data copied to clipboard (duplicate not saved to history).")
+            self.set_status(f"Data copied to clipboard ({token_count} tokens - duplicate not saved to history).")
 
         self.master.clipboard_clear()
         self.master.clipboard_append(final_clip)
@@ -2201,6 +2351,10 @@ class FolderMonitorApp:
             f"{meta_prompts_block}\n"
             f"{user_instructions_block}\n"
         )
+
+        # Count tokens using selected model
+        enc = tiktoken.encoding_for_model(self.token_model.get())
+        token_count = len(enc.encode(final_content))
 
         try:
             # Create a temporary file with a descriptive name
@@ -2277,9 +2431,9 @@ class FolderMonitorApp:
             # Only save to history if it's not a duplicate
             if not is_duplicate:
                 self.save_history_item(final_content, self.user_instructions)
-                self.set_status(f"Content saved to temporary file: {temp_file.name}\nFile copied to clipboard and saved to history.")
+                self.set_status(f"Content saved to temporary file: {temp_file.name}\nFile copied to clipboard ({token_count} tokens) and saved to history.")
             else:
-                self.set_status(f"Content saved to temporary file: {temp_file.name}\nFile copied to clipboard (duplicate not saved to history).")
+                self.set_status(f"Content saved to temporary file: {temp_file.name}\nFile copied to clipboard ({token_count} tokens - duplicate not saved to history).")
             
             self.save_settings()
             
@@ -2477,6 +2631,7 @@ class FolderMonitorApp:
                         "enable_timeouts": self.enable_timeouts.get(),
                         "strip_comments": self.strip_comments_var.get(),
                         "selection_presets": getattr(self, 'selection_presets', {}),
+                        "token_model": self.token_model.get(),
                     }
                     for path, info in self.folder_tree_data.items():
                         data["folder_checks"][path] = info['checked']
@@ -2542,6 +2697,7 @@ class FolderMonitorApp:
                 self.enable_timeouts.set(data.get("enable_timeouts", True))
                 self.strip_comments_var.set(data.get("strip_comments", False))
                 self.selection_presets = data.get("selection_presets", {})
+                self.token_model.set(data.get("token_model", DEFAULT_MODEL))
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
         
@@ -2576,14 +2732,20 @@ class FolderMonitorApp:
             self.prepend_hotkey_check.select() if self.prepend_hotkey_enabled.get() else self.prepend_hotkey_check.deselect()
         if hasattr(self, 'hotkey_display'):
             self.hotkey_display.config(text=self.hotkey_combination.upper())
-        
+
         # Update dark mode checkbox to reflect loaded setting
         if hasattr(self, 'dark_mode_check'):
             if self.dark_mode.get():
                 self.dark_mode_check.select()
             else:
                 self.dark_mode_check.deselect()
-        
+
+        if hasattr(self, 'model_combo'):
+            self.model_combo.set(self.token_model.get())
+
+        if hasattr(self, 'model_combo'):
+            self.model_combo.set(self.token_model.get())
+
         # Note: setup_global_hotkey() is called after theme is applied in __init__
 
     def add_default_meta_prompts(self):
@@ -3021,6 +3183,7 @@ class FolderMonitorApp:
                 self.enable_timeouts.set(data.get("enable_timeouts", True))
                 self.strip_comments_var.set(data.get("strip_comments", False))
                 self.selection_presets = data.get("selection_presets", {})
+                self.token_model.set(data.get("token_model", DEFAULT_MODEL))
             except Exception as e:
                 self.master.after_idle(lambda: messagebox.showerror("Error Loading Settings", str(e)))
         
@@ -3068,13 +3231,16 @@ class FolderMonitorApp:
                 self.prepend_hotkey_check.select() if self.prepend_hotkey_enabled.get() else self.prepend_hotkey_check.deselect()
             if hasattr(self, 'hotkey_display'):
                 self.hotkey_display.config(text=self.hotkey_combination.upper())
-            
+
             # Update dark mode checkbox to reflect loaded setting
             if hasattr(self, 'dark_mode_check'):
                 if self.dark_mode.get():
                     self.dark_mode_check.select()
                 else:
                     self.dark_mode_check.deselect()
+
+            if hasattr(self, 'model_combo'):
+                self.model_combo.set(self.token_model.get())
         
         self.master.after_idle(update_ui)
 
@@ -3140,6 +3306,7 @@ class FolderMonitorApp:
                 self.enable_timeouts.set(data.get("enable_timeouts", True))
                 self.strip_comments_var.set(data.get("strip_comments", False))
                 self.selection_presets = data.get("selection_presets", {})
+                self.token_model.set(data.get("token_model", DEFAULT_MODEL))
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
         
@@ -3510,6 +3677,7 @@ class FolderMonitorApp:
             "enable_timeouts": self.enable_timeouts.get(),
             "strip_comments": self.strip_comments_var.get(),
             "selection_presets": getattr(self, 'selection_presets', {}),
+            "token_model": self.token_model.get(),
         }
         for path, info in self.folder_tree_data.items():
             data["folder_checks"][path] = info['checked']

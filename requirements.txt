@@ -3,5 +3,5 @@
 # requests==2.25.1
 # numpy>=1.20 
 global-hotkeys
-keyboard
-pyperclip 
+keyboardpyperclip
+tiktoken>=0.9
