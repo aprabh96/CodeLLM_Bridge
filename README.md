@@ -135,6 +135,9 @@ This enhancement ensures CodeLLM Bridge starts reliably even when network folder
 - **Comment Stripping**: Optionally remove comments from copied code blocks
   - Programming language is detected automatically per file
   - Reduces the number of tokens sent to the AI for analysis
+- **Token Counting**: Select an OpenAI model and display token count after copying
+  - Uses `tiktoken` for accurate counts
+  - Default model is `o3`
 - **Temporary File Export**: Save content to a temporary file and copy the file to clipboard
   - Ideal for large codebases that exceed AI input field character limits
   - Creates timestamped temporary files that can be uploaded to AI tools
