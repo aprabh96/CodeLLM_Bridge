@@ -2,6 +2,7 @@ import os
 import json
 import time
 import fnmatch
+import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter.scrolledtext import ScrolledText
@@ -247,6 +248,35 @@ def read_file_with_fallback(path):
             with open(path, 'r', encoding='cp1252', errors='replace') as f:
                 return f.read()
 
+def remove_comments_from_code(code, ext):
+    """Remove comments from code based on file extension."""
+    patterns = {
+        'py': [r'(?m)#.*$', r'""".*?"""', r"'''(?:.|\n)*?'''"],
+        'js': [r'(?m)//.*$', r'/\*.*?\*/'],
+        'ts': [r'(?m)//.*$', r'/\*.*?\*/'],
+        'java': [r'(?m)//.*$', r'/\*.*?\*/'],
+        'c': [r'(?m)//.*$', r'/\*.*?\*/'],
+        'cpp': [r'(?m)//.*$', r'/\*.*?\*/'],
+        'h': [r'(?m)//.*$', r'/\*.*?\*/'],
+        'cs': [r'(?m)//.*$', r'/\*.*?\*/'],
+        'go': [r'(?m)//.*$', r'/\*.*?\*/'],
+        'rb': [r'(?m)#.*$', r'=begin(?:.|\n)*?=end'],
+        'php': [r'(?m)//.*$', r'(?m)#.*$', r'/\*.*?\*/'],
+        'sh': [r'(?m)#.*$'],
+        'bash': [r'(?m)#.*$'],
+        'rs': [r'(?m)//.*$', r'/\*.*?\*/'],
+        'html': [r'<!--.*?-->'],
+        'xml': [r'<!--.*?-->'],
+    }
+
+    if ext not in patterns:
+        return code
+
+    new_code = code
+    for pat in patterns[ext]:
+        new_code = re.sub(pat, '', new_code, flags=re.DOTALL)
+    return new_code
+
 class FolderMonitorApp:
     def __init__(self, master):
         self.master = master
@@ -380,6 +410,9 @@ class FolderMonitorApp:
 
         # Checkbox for copying entire file tree
         self.copy_entire_tree_var = tk.BooleanVar(value=False)
+
+        # Option to strip comments from copied code
+        self.strip_comments_var = tk.BooleanVar(value=False)
 
         # Instructions expanded state
         self.instructions_expanded = tk.BooleanVar(value=False)
@@ -543,6 +576,14 @@ class FolderMonitorApp:
             variable=self.copy_entire_tree_var
         )
         chk_full_tree.pack(side=tk.LEFT, padx=5)
+
+        # Checkbox: strip comments from copied code
+        chk_strip_comments = tk.Checkbutton(
+            top_frame,
+            text="Remove comments from copied code",
+            variable=self.strip_comments_var
+        )
+        chk_strip_comments.pack(side=tk.LEFT, padx=5)
 
         # Add Meta Prompt
         btn_add_prompt = tk.Button(top_frame, text="Add New Meta Prompt", command=self.on_add_prompt)
@@ -2392,6 +2433,8 @@ class FolderMonitorApp:
             lines.append(f"```{ext}")
             try:
                 content = read_file_with_fallback(path)
+                if self.strip_comments_var.get():
+                    content = remove_comments_from_code(content, ext)
                 lines.append(content)
             except Exception as e:
                 lines.append(f"<Error reading file: {e}>")
@@ -2432,6 +2475,7 @@ class FolderMonitorApp:
                         "prepend_hotkey_enabled": self.prepend_hotkey_enabled.get(),
                         "hotkey_combination": self.hotkey_combination,
                         "enable_timeouts": self.enable_timeouts.get(),
+                        "strip_comments": self.strip_comments_var.get(),
                         "selection_presets": getattr(self, 'selection_presets', {}),
                     }
                     for path, info in self.folder_tree_data.items():
@@ -2496,6 +2540,7 @@ class FolderMonitorApp:
                 self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
                 self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
                 self.enable_timeouts.set(data.get("enable_timeouts", True))
+                self.strip_comments_var.set(data.get("strip_comments", False))
                 self.selection_presets = data.get("selection_presets", {})
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
@@ -2974,6 +3019,7 @@ class FolderMonitorApp:
                 self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
                 self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
                 self.enable_timeouts.set(data.get("enable_timeouts", True))
+                self.strip_comments_var.set(data.get("strip_comments", False))
                 self.selection_presets = data.get("selection_presets", {})
             except Exception as e:
                 self.master.after_idle(lambda: messagebox.showerror("Error Loading Settings", str(e)))
@@ -3092,6 +3138,7 @@ class FolderMonitorApp:
                 self.prepend_hotkey_enabled.set(data.get("prepend_hotkey_enabled", False))
                 self.hotkey_combination = data.get("hotkey_combination", "ctrl+alt+v")
                 self.enable_timeouts.set(data.get("enable_timeouts", True))
+                self.strip_comments_var.set(data.get("strip_comments", False))
                 self.selection_presets = data.get("selection_presets", {})
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
@@ -3194,6 +3241,7 @@ class FolderMonitorApp:
         self.saved_folder_checks = {}
         self.ignore_patterns = self.default_initial_ignore_patterns.copy()
         self.copy_entire_tree_var.set(False)
+        self.strip_comments_var.set(False)
         self.filter_system_folders.set(True)
         self.dark_mode.set(False)
         self.prepend_string = DEFAULT_PREPEND_STRING
@@ -3460,6 +3508,7 @@ class FolderMonitorApp:
             "prepend_hotkey_enabled": self.prepend_hotkey_enabled.get(),
             "hotkey_combination": self.hotkey_combination,
             "enable_timeouts": self.enable_timeouts.get(),
+            "strip_comments": self.strip_comments_var.get(),
             "selection_presets": getattr(self, 'selection_presets', {}),
         }
         for path, info in self.folder_tree_data.items():
