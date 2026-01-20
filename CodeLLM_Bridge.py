@@ -433,28 +433,44 @@ SMART_SELECT_CODE_EXTENSIONS = {
     '.env.example', '.env.sample',  # Example env files (not actual .env)
 }
 
-SMART_SELECT_DEFAULT_PROMPT = """You are an intelligent file selector for a code project. Your job is to select all the 
-relevant source code files that would be needed to understand the codebase, while 
-EXCLUDING:
+SMART_SELECT_DEFAULT_PROMPT = """You are the AI assistant for **CodeLLM Bridge** by Psynect Corp, a desktop application 
+that helps developers copy their source code into AI chats (like ChatGPT, Claude, Gemini, etc.) for analysis.
 
-1. **Dependency folders**: node_modules, venv, __pycache__, .venv, vendor, packages, 
-   bower_components, .pip, site-packages, lib/, libs/, external/
-2. **Build outputs**: dist, build, out, output, bin, obj, target, .next, .nuxt
-3. **Non-code files**: Images, videos, audio, archives (.zip, .rar, .7z, .tar.gz), 
-   executables (.exe, .dll, .so), fonts
-4. **IDE/Editor folders**: .idea, .vscode, .vs, .eclipse
-5. **Cache/temp files**: .cache, .tmp, temp, logs
+## Your Purpose
+Users want to paste their codebase into an AI chat to get help understanding, debugging, or improving their code.
+Your job is to intelligently select the relevant source code files they should include, while keeping the 
+total size manageable (AI chats have context limits).
 
-ONLY select files with code-like extensions (e.g., .py, .js, .ts, .html, .css, etc.)
+## What to SELECT (these files help AI understand the codebase):
+- Source code files (.py, .js, .ts, .jsx, .tsx, .java, .cpp, .c, .go, .rs, .rb, .php, etc.)
+- Configuration files (package.json, requirements.txt, tsconfig.json, Cargo.toml, etc.)
+- Entry points and main files
+- README, documentation if helpful
+- Test files (only if user asks or they're essential)
 
-Use your tools to explore the directory structure and check the relevant files.
-For directories with more than 100 items, just note them and skip detailed exploration.
+## What to EXCLUDE (these waste tokens and add noise):
+1. **Dependency folders**: node_modules, venv, __pycache__, vendor, packages, site-packages
+2. **Build outputs**: dist, build, out, .next, .nuxt, bin, obj, target
+3. **Non-code files**: Images, videos, audio, archives, executables, fonts
+4. **IDE folders**: .idea, .vscode, .vs, .eclipse
+5. **Cache/temp files**: .cache, .tmp, logs
+6. **Lock files**: package-lock.json, yarn.lock, Gemfile.lock (usually too large)
 
-START by calling list_directory on the root folder(s) to see what's available.
-Then systematically explore and select the code files.
-When done, call finish_selection with a summary.
+## How to Work
+1. START by calling `list_directory` on the root folder(s) to see the project structure
+2. Explore subdirectories that look relevant (src/, lib/, app/, components/, etc.)
+3. If unsure about a file, use `read_file_preview` to peek at the first few lines
+4. Use `check_files` or `check_directory` to select what's relevant
+5. For large directories (100+ items), you'll get a summary - use `list_directory_full` if you need all items
+6. When done, call `finish_selection` with a summary of what you selected
 
-[USER INSTRUCTIONS BELOW]
+## Token Awareness
+- The user will copy selected files to their clipboard for an AI chat
+- Be selective - choose quality over quantity
+- Focus on core logic, not every single file
+- If a directory has obvious tests/examples subdirs, you can often skip those unless asked
+
+[USER'S ADDITIONAL INSTRUCTIONS BELOW]
 """
 
 # Tool definitions for Smart Select (Claude-compatible format)
@@ -468,6 +484,34 @@ SMART_SELECT_TOOLS = [
                 "path": {
                     "type": "string",
                     "description": "The directory path to list (absolute or relative to root folders)"
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "list_directory_full",
+        "description": "List ALL contents of a large directory (bypasses the 100-item summary limit). Use sparingly - only when you need to see everything in a directory that was summarized.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The directory path to fully list"
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "read_file_preview",
+        "description": "Read the first few lines of a file to understand what it contains. Useful for deciding if a file is relevant. Returns up to 50 lines or 2000 characters, whichever is smaller.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to preview"
                 }
             },
             "required": ["path"]
@@ -624,6 +668,10 @@ class SmartSelectAgent:
         try:
             if tool_name == "list_directory":
                 return self._list_directory(tool_input.get("path", ""))
+            elif tool_name == "list_directory_full":
+                return self._list_directory_full(tool_input.get("path", ""))
+            elif tool_name == "read_file_preview":
+                return self._read_file_preview(tool_input.get("path", ""))
             elif tool_name == "check_files":
                 return self._check_files(tool_input.get("paths", []))
             elif tool_name == "uncheck_files":
@@ -723,6 +771,97 @@ class SmartSelectAgent:
             result += f"  {marker} 📄 {f}\n"
         
         return result
+    
+    def _list_directory_full(self, path: str) -> str:
+        """List ALL contents of a directory (no 100-item limit)."""
+        if not path:
+            return "Path required for list_directory_full"
+        
+        resolved_path = self._resolve_path(path)
+        
+        if not os.path.exists(resolved_path):
+            return f"Path does not exist: {path}"
+        
+        if not os.path.isdir(resolved_path):
+            return f"Not a directory: {path}"
+        
+        try:
+            items = os.listdir(resolved_path)
+        except PermissionError:
+            return f"Permission denied: {path}"
+        except Exception as e:
+            return f"Error reading directory: {e}"
+        
+        # Filter out ignored items
+        filtered_dirs = []
+        filtered_files = []
+        
+        for item in items:
+            item_path = os.path.join(resolved_path, item)
+            
+            if os.path.isdir(item_path):
+                if not self._is_ignored_dir(item):
+                    filtered_dirs.append(item)
+            else:
+                if not self._is_ignored_extension(item):
+                    filtered_files.append(item)
+        
+        # Show full listing (no limit)
+        result = f"Full contents of {path} ({len(filtered_dirs)} dirs, {len(filtered_files)} files):\n"
+        
+        for d in sorted(filtered_dirs):
+            result += f"  📁 {d}/\n"
+        
+        for f in sorted(filtered_files):
+            is_code = self._is_code_extension(f)
+            marker = "✓" if is_code else " "
+            result += f"  {marker} 📄 {f}\n"
+        
+        return result
+    
+    def _read_file_preview(self, path: str) -> str:
+        """Read the first few lines of a file to preview its contents."""
+        if not path:
+            return "Path required for read_file_preview"
+        
+        resolved_path = self._resolve_path(path)
+        
+        if not os.path.exists(resolved_path):
+            return f"File does not exist: {path}"
+        
+        if os.path.isdir(resolved_path):
+            return f"Cannot preview a directory: {path}"
+        
+        # Check file size first
+        try:
+            file_size = os.path.getsize(resolved_path)
+            if file_size > 1_000_000:  # 1MB
+                return f"File too large to preview ({file_size:,} bytes): {path}"
+        except:
+            pass
+        
+        try:
+            # Try reading with UTF-8
+            with open(resolved_path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = []
+                total_chars = 0
+                max_lines = 50
+                max_chars = 2000
+                
+                for line in f:
+                    if len(lines) >= max_lines or total_chars >= max_chars:
+                        break
+                    lines.append(line.rstrip('\n\r'))
+                    total_chars += len(line)
+                
+                preview = '\n'.join(lines)
+                if total_chars >= max_chars or len(lines) >= max_lines:
+                    preview += f"\n... (truncated, showing first {len(lines)} lines)"
+                
+                return f"Preview of {os.path.basename(path)}:\n```\n{preview}\n```"
+        
+        except Exception as e:
+            return f"Error reading file: {e}"
     
     def _check_files(self, paths: list) -> str:
         """Check (select) files in the tree."""
@@ -903,14 +1042,25 @@ class SmartSelectAgent:
             iteration += 1
             
             try:
-                # Call Claude with streaming
+                # Build system with caching enabled (reduces cost on subsequent turns)
+                # Use cache_control to cache the system prompt
+                system_with_cache = [
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]
+                
+                # Call Claude with streaming and prompt caching
                 with self.client.messages.stream(
                     model=self.model,
                     max_tokens=4096,
-                    system=system_prompt,
+                    system=system_with_cache,
                     tools=SMART_SELECT_TOOLS,
                     tool_choice={"type": "auto"},
-                    messages=self.conversation_history
+                    messages=self.conversation_history,
+                    extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
                 ) as stream:
                     
                     for event in stream:
@@ -923,6 +1073,23 @@ class SmartSelectAgent:
                     
                     # Get the final message
                     final_message = stream.get_final_message()
+                    
+                    # Track token usage
+                    if hasattr(final_message, 'usage'):
+                        usage = final_message.usage
+                        input_tokens = getattr(usage, 'input_tokens', 0)
+                        output_tokens = getattr(usage, 'output_tokens', 0)
+                        cache_read = getattr(usage, 'cache_read_input_tokens', 0)
+                        cache_creation = getattr(usage, 'cache_creation_input_tokens', 0)
+                        
+                        yield {
+                            "type": "usage",
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "cache_read_tokens": cache_read,
+                            "cache_creation_tokens": cache_creation,
+                            "iteration": iteration
+                        }
                     
                     # Check for tool use blocks
                     tool_use_blocks = [
@@ -1224,6 +1391,21 @@ class SmartSelectDialog:
         # Status label
         self.status_label = tk.Label(button_frame, text="Ready", fg="gray")
         self.status_label.pack(side=tk.LEFT, padx=(20, 0))
+        
+        # Token usage display (below buttons)
+        usage_frame = tk.Frame(main_frame)
+        usage_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        self.usage_label = tk.Label(usage_frame, 
+                                   text="💰 Tokens: -- input | -- output | Cache: --",
+                                   fg="gray", font=("Arial", 9))
+        self.usage_label.pack(side=tk.LEFT)
+        
+        # Track cumulative usage
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cache_read = 0
+        self.total_cache_created = 0
     
     def log(self, message: str, tag: str = None):
         """Add a message to the log."""
@@ -1275,8 +1457,16 @@ class SmartSelectDialog:
         self.log_text.delete("1.0", tk.END)
         self.log_text.config(state=tk.DISABLED)
         
+        # Reset token counters
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cache_read = 0
+        self.total_cache_created = 0
+        self.usage_label.config(text="💰 Tokens: -- input | -- output | Cache: --")
+        
         self.log("Starting Smart Select with Claude Opus 4.5...", "INFO")
         self.log(f"Root folders: {len(self.app.root_folders)}", "INFO")
+        self.log("Prompt caching enabled - subsequent iterations cost 90% less!", "INFO")
         
         # Run in a thread to keep UI responsive
         def run_agent():
@@ -1311,6 +1501,9 @@ class SmartSelectDialog:
                     
                     elif event["type"] == "error":
                         self.dialog.after(0, lambda e=event: self._on_error(e))
+                    
+                    elif event["type"] == "usage":
+                        self.dialog.after(0, lambda e=event: self._update_usage(e))
                 
             except Exception as e:
                 self.dialog.after(0, lambda err=str(e): self._on_error({"message": err}))
@@ -1337,6 +1530,32 @@ class SmartSelectDialog:
         self.cancel_button.config(state=tk.DISABLED)
         self.status_label.config(text="Error", fg="red")
         self.log(f"\n❌ Error: {event.get('message', 'Unknown error')}", "ERROR")
+    
+    def _update_usage(self, event):
+        """Update token usage display."""
+        # Accumulate totals
+        self.total_input_tokens += event.get("input_tokens", 0)
+        self.total_output_tokens += event.get("output_tokens", 0)
+        self.total_cache_read += event.get("cache_read_tokens", 0)
+        self.total_cache_created += event.get("cache_creation_tokens", 0)
+        
+        # Calculate estimated cost (Claude Opus 4.5 pricing: $15/M input, $75/M output)
+        # Cache reads are 90% cheaper
+        input_cost = (self.total_input_tokens - self.total_cache_read) * 15 / 1_000_000
+        cache_cost = self.total_cache_read * 1.5 / 1_000_000  # 90% discount
+        output_cost = self.total_output_tokens * 75 / 1_000_000
+        total_cost = input_cost + cache_cost + output_cost
+        
+        # Format display
+        cache_info = ""
+        if self.total_cache_read > 0:
+            cache_info = f" | 📦 Cache: {self.total_cache_read:,} read"
+        
+        usage_text = (
+            f"💰 Tokens: {self.total_input_tokens:,} in | {self.total_output_tokens:,} out"
+            f"{cache_info} | Est: ${total_cost:.4f}"
+        )
+        self.usage_label.config(text=usage_text)
     
     def on_cancel(self):
         """Cancel the running process."""
@@ -1410,7 +1629,8 @@ class FolderMonitorApp:
         self.user_instructions = ""
         
         # Anthropic API key for Smart Select (Claude Opus 4.5)
-        self.anthropic_api_key = ""
+        # This is a GLOBAL setting, not per-profile
+        self.anthropic_api_key = self._load_global_anthropic_api_key()
 
         # Default ignore patterns for common system folders
         self.default_ignore_patterns = [
@@ -3569,6 +3789,37 @@ class FolderMonitorApp:
     # -----------------------------------------------------------------------
     #  SAVE / LOAD
     # -----------------------------------------------------------------------
+    def _load_global_anthropic_api_key(self):
+        """Load the Anthropic API key from the global app_settings.json file.
+        This is a global setting, not per-profile."""
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                return data.get("anthropic_api_key", "")
+        except Exception as e:
+            print(f"Warning: Could not load global API key: {e}")
+        return ""
+    
+    def _save_global_anthropic_api_key(self):
+        """Save the Anthropic API key to the global app_settings.json file.
+        This is always saved to the global file, not to profiles."""
+        try:
+            # Load existing global settings
+            data = {}
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            
+            # Update just the API key
+            data["anthropic_api_key"] = self.anthropic_api_key
+            
+            # Save back
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Could not save global API key: {e}")
+    
     def save_settings(self):
         """Save settings to either default or profile."""
         if self.current_profile == "default":
@@ -3599,6 +3850,8 @@ class FolderMonitorApp:
                 messagebox.showerror("Error Saving Settings", str(e))
         else:
             self.save_profile(self.current_profile)
+            # Also save the global API key (it's not stored in profiles)
+            self._save_global_anthropic_api_key()
 
     def load_settings(self):
         """Load settings from either default or profile."""
@@ -3657,7 +3910,7 @@ class FolderMonitorApp:
                 self.strip_comments_var.set(data.get("strip_comments", False))
                 self.selection_presets = data.get("selection_presets", {})
                 self.token_model.set(data.get("token_model", DEFAULT_MODEL))
-                self.anthropic_api_key = data.get("anthropic_api_key", "")
+                # Note: anthropic_api_key is loaded globally in __init__, not from profile
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
         
@@ -4658,7 +4911,7 @@ class FolderMonitorApp:
             "strip_comments": self.strip_comments_var.get(),
             "selection_presets": getattr(self, 'selection_presets', {}),
             "token_model": self.token_model.get(),
-            "anthropic_api_key": getattr(self, 'anthropic_api_key', ''),
+            # Note: anthropic_api_key is a global setting, saved separately
         }
         for path, info in self.folder_tree_data.items():
             data["folder_checks"][path] = info['checked']
