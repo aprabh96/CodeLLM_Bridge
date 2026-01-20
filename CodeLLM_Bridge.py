@@ -27,6 +27,12 @@ import tempfile
 import signal
 import queue
 import tiktoken
+try:
+    from anthropic import Anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    print("Warning: anthropic package not installed. Smart Select feature will be disabled.")
 
 TOKENIZATION_HELP = """
 Below is a **drop-in technical docstring** you can paste straight into your codebase (or feed to an AI-agent) to give it everything it needs to install `tiktoken`, pick the right tokenizer for any OpenAI model, and fall back gracefully when new models appear.
@@ -364,6 +370,638 @@ class FolderLoadingTimeout:
     def _timeout_handler(self, signum, frame):
         raise TimeoutError(f"Folder loading timed out after {self.timeout_seconds} seconds")
 
+# =============================================================================
+# SMART SELECT AI FEATURE - Constants and Classes
+# =============================================================================
+
+# Extensions that are pre-filtered (AI never sees these)
+SMART_SELECT_IGNORED_EXTENSIONS = {
+    # Media files
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg', '.webp', '.tiff', '.tif',
+    '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.3gp',
+    '.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.wma',
+    # Archives
+    '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz', '.tbz2',
+    # Executables and binaries
+    '.exe', '.dll', '.so', '.dylib', '.msi', '.deb', '.rpm', '.app', '.dmg',
+    '.bin', '.dat', '.db', '.sqlite', '.sqlite3',
+    # Fonts
+    '.ttf', '.otf', '.woff', '.woff2', '.eot',
+    # Documents (non-code)
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp',
+    # Other
+    '.pyc', '.pyo', '.class', '.o', '.obj', '.a', '.lib', '.pdb',
+    '.map', '.min.js', '.min.css',  # Minified files
+    '.lock',  # Lock files
+}
+
+# Directories that are pre-filtered (AI never sees these)
+SMART_SELECT_IGNORED_DIRS = {
+    # Package managers / Dependencies
+    'node_modules', 'venv', '.venv', 'env', '.env', '__pycache__', '.pytest_cache',
+    'vendor', 'packages', 'bower_components', '.pip', 'site-packages', 'pip-cache',
+    '.npm', '.yarn', '.pnpm-store',
+    # Build outputs
+    'dist', 'build', 'out', 'output', 'bin', 'obj', 'target', 'cmake-build-debug',
+    'cmake-build-release', '.next', '.nuxt', '.output', '.vercel', '.netlify',
+    # Version control
+    '.git', '.svn', '.hg', '.bzr',
+    # IDE/Editor
+    '.idea', '.vscode', '.vs', '.eclipse', '.settings', '.project',
+    # Cache/temp
+    '.cache', '.tmp', 'tmp', 'temp', 'logs', '.mypy_cache', '.ruff_cache',
+    '.tox', '.nox', 'htmlcov', '.coverage', '.nyc_output', 'coverage',
+    # Other
+    '.terraform', '.vagrant', '.docker', '__MACOSX',
+}
+
+# Code extensions the AI should consider
+SMART_SELECT_CODE_EXTENSIONS = {
+    '.py', '.js', '.ts', '.tsx', '.jsx', '.html', '.htm', '.css', '.scss', '.less', '.sass',
+    '.json', '.yaml', '.yml', '.xml', '.toml', '.ini', '.cfg', '.conf',
+    '.java', '.c', '.cpp', '.cc', '.h', '.hpp', '.hxx', '.cs', '.fs', '.vb',
+    '.go', '.rs', '.rb', '.php', '.swift', '.kt', '.kts', '.scala', '.clj', '.cljs',
+    '.vue', '.svelte', '.astro',
+    '.md', '.rst', '.txt',  # Documentation
+    '.sql', '.graphql', '.gql',
+    '.sh', '.bash', '.zsh', '.fish', '.bat', '.cmd', '.ps1', '.psm1',
+    '.lua', '.r', '.R', '.pl', '.pm', '.dart', '.zig', '.nim', '.ex', '.exs', '.erl', '.hrl',
+    '.tf', '.tfvars',  # Terraform
+    '.dockerfile', '.containerfile',  # Docker
+    '.makefile', '.mk', '.cmake',  # Build files
+    '.proto', '.thrift', '.avsc',  # Schema files
+    '.env.example', '.env.sample',  # Example env files (not actual .env)
+}
+
+SMART_SELECT_DEFAULT_PROMPT = """You are an intelligent file selector for a code project. Your job is to select all the 
+relevant source code files that would be needed to understand the codebase, while 
+EXCLUDING:
+
+1. **Dependency folders**: node_modules, venv, __pycache__, .venv, vendor, packages, 
+   bower_components, .pip, site-packages, lib/, libs/, external/
+2. **Build outputs**: dist, build, out, output, bin, obj, target, .next, .nuxt
+3. **Non-code files**: Images, videos, audio, archives (.zip, .rar, .7z, .tar.gz), 
+   executables (.exe, .dll, .so), fonts
+4. **IDE/Editor folders**: .idea, .vscode, .vs, .eclipse
+5. **Cache/temp files**: .cache, .tmp, temp, logs
+
+ONLY select files with code-like extensions (e.g., .py, .js, .ts, .html, .css, etc.)
+
+Use your tools to explore the directory structure and check the relevant files.
+For directories with more than 100 items, just note them and skip detailed exploration.
+
+START by calling list_directory on the root folder(s) to see what's available.
+Then systematically explore and select the code files.
+When done, call finish_selection with a summary.
+
+[USER INSTRUCTIONS BELOW]
+"""
+
+# Tool definitions for Smart Select (Claude-compatible format)
+SMART_SELECT_TOOLS = [
+    {
+        "name": "list_directory",
+        "description": "List contents of a directory (files and subdirectories). Returns names and types only, not file contents. For large directories (100+ items), returns a summary instead of full list. Dependencies and binary files are pre-filtered.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The directory path to list (absolute or relative to root folders)"
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "check_files",
+        "description": "Check (select) one or more files or directories in the tree. Files will be included when copying to clipboard.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of file or directory paths to check/select"
+                }
+            },
+            "required": ["paths"]
+        }
+    },
+    {
+        "name": "uncheck_files",
+        "description": "Uncheck (deselect) one or more files or directories in the tree.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of file or directory paths to uncheck/deselect"
+                }
+            },
+            "required": ["paths"]
+        }
+    },
+    {
+        "name": "check_directory",
+        "description": "Check all visible code files in a directory recursively.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The directory path to recursively check"
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "uncheck_directory",
+        "description": "Uncheck all files in a directory recursively.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The directory path to recursively uncheck"
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "get_current_selections",
+        "description": "Get a summary of what's currently selected (checked files count by extension).",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "finish_selection",
+        "description": "Complete the selection process. Call this when you're done selecting files.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "A brief summary of what was selected and why"
+                }
+            },
+            "required": ["summary"]
+        }
+    }
+]
+
+
+class SmartSelectAgent:
+    """
+    AI Agent for Smart File Selection using Claude Opus 4.5.
+    
+    Implements an agentic loop that:
+    1. Takes a user prompt about what to select
+    2. Uses tools to explore directories and select files
+    3. Continues until finish_selection is called
+    """
+    
+    def __init__(self, api_key: str, folder_monitor_app, model: str = "claude-opus-4-5-20251101"):
+        """
+        Initialize the Smart Select agent.
+        
+        Args:
+            api_key: Anthropic API key
+            folder_monitor_app: Reference to the FolderMonitorApp instance
+            model: Claude model to use (default: Claude Opus 4.5)
+        """
+        if not ANTHROPIC_AVAILABLE:
+            raise RuntimeError("Anthropic package not installed. Run: pip install anthropic>=0.40.0")
+        
+        self.api_key = api_key
+        self.client = Anthropic(api_key=api_key)
+        self.app = folder_monitor_app
+        self.model = model
+        self.conversation_history = []
+        self.cancelled = False
+    
+    def cancel(self):
+        """Cancel the current operation."""
+        self.cancelled = True
+    
+    def _is_ignored_extension(self, filename: str) -> bool:
+        """Check if a file has an ignored extension."""
+        _, ext = os.path.splitext(filename.lower())
+        return ext in SMART_SELECT_IGNORED_EXTENSIONS
+    
+    def _is_ignored_dir(self, dirname: str) -> bool:
+        """Check if a directory name should be ignored."""
+        return dirname.lower() in SMART_SELECT_IGNORED_DIRS
+    
+    def _is_code_extension(self, filename: str) -> bool:
+        """Check if a file has a code extension."""
+        _, ext = os.path.splitext(filename.lower())
+        return ext in SMART_SELECT_CODE_EXTENSIONS
+    
+    def _resolve_path(self, path: str) -> str:
+        """Resolve a path that might be relative to a root folder."""
+        # If it's already absolute and exists, use it
+        if os.path.isabs(path) and os.path.exists(path):
+            return path
+        
+        # Try to find it relative to each root folder
+        for root in self.app.root_folders:
+            full_path = os.path.join(root, path)
+            if os.path.exists(full_path):
+                return full_path
+        
+        # Return as-is (might be an absolute path that doesn't exist)
+        return path
+    
+    def execute_tool(self, tool_name: str, tool_input: dict) -> str:
+        """Execute a tool and return the result as a string."""
+        try:
+            if tool_name == "list_directory":
+                return self._list_directory(tool_input.get("path", ""))
+            elif tool_name == "check_files":
+                return self._check_files(tool_input.get("paths", []))
+            elif tool_name == "uncheck_files":
+                return self._uncheck_files(tool_input.get("paths", []))
+            elif tool_name == "check_directory":
+                return self._check_directory(tool_input.get("path", ""))
+            elif tool_name == "uncheck_directory":
+                return self._uncheck_directory(tool_input.get("path", ""))
+            elif tool_name == "get_current_selections":
+                return self._get_current_selections()
+            elif tool_name == "finish_selection":
+                return self._finish_selection(tool_input.get("summary", "Selection complete"))
+            else:
+                return f"Unknown tool: {tool_name}"
+        except Exception as e:
+            return f"Error executing {tool_name}: {str(e)}"
+    
+    def _list_directory(self, path: str) -> str:
+        """List contents of a directory, filtering out ignored items."""
+        if not path:
+            # List all root folders
+            if not self.app.root_folders:
+                return "No root folders configured. Please add folders first."
+            result = "Root folders:\n"
+            for root in self.app.root_folders:
+                result += f"  📁 {root}\n"
+            return result
+        
+        resolved_path = self._resolve_path(path)
+        
+        if not os.path.exists(resolved_path):
+            return f"Path does not exist: {path}"
+        
+        if not os.path.isdir(resolved_path):
+            return f"Not a directory: {path}"
+        
+        try:
+            items = os.listdir(resolved_path)
+        except PermissionError:
+            return f"Permission denied: {path}"
+        except Exception as e:
+            return f"Error reading directory: {e}"
+        
+        # Filter out ignored items
+        filtered_dirs = []
+        filtered_files = []
+        
+        for item in items:
+            item_path = os.path.join(resolved_path, item)
+            
+            if os.path.isdir(item_path):
+                if not self._is_ignored_dir(item):
+                    filtered_dirs.append(item)
+            else:
+                if not self._is_ignored_extension(item):
+                    filtered_files.append(item)
+        
+        total_items = len(filtered_dirs) + len(filtered_files)
+        
+        if total_items == 0:
+            return f"Directory is empty or contains only ignored items: {path}"
+        
+        if total_items > 100:
+            # Summarize large directories
+            result = f"Large directory ({total_items} items after filtering):\n"
+            result += f"  📁 Subdirectories: {len(filtered_dirs)}\n"
+            result += f"  📄 Files: {len(filtered_files)}\n"
+            
+            # Show a sample
+            if filtered_dirs:
+                result += f"  Sample dirs: {', '.join(filtered_dirs[:5])}"
+                if len(filtered_dirs) > 5:
+                    result += f" ... and {len(filtered_dirs) - 5} more"
+                result += "\n"
+            
+            if filtered_files:
+                # Group by extension
+                ext_counts = {}
+                for f in filtered_files:
+                    _, ext = os.path.splitext(f)
+                    ext = ext or "(no ext)"
+                    ext_counts[ext] = ext_counts.get(ext, 0) + 1
+                result += f"  File types: {dict(ext_counts)}\n"
+            
+            result += "\nUse check_directory to select all code files, or explore subdirectories individually."
+            return result
+        
+        # Show full listing for smaller directories
+        result = f"Contents of {path}:\n"
+        
+        for d in sorted(filtered_dirs):
+            result += f"  📁 {d}/\n"
+        
+        for f in sorted(filtered_files):
+            is_code = self._is_code_extension(f)
+            marker = "✓" if is_code else " "
+            result += f"  {marker} 📄 {f}\n"
+        
+        return result
+    
+    def _check_files(self, paths: list) -> str:
+        """Check (select) files in the tree."""
+        if not paths:
+            return "No paths provided"
+        
+        checked_count = 0
+        errors = []
+        
+        for path in paths:
+            resolved_path = self._resolve_path(path)
+            
+            if resolved_path in self.app.folder_tree_data:
+                if not self.app.folder_tree_data[resolved_path]['checked']:
+                    self.app.folder_tree_data[resolved_path]['checked'] = True
+                    checked_count += 1
+                    # Update tree display
+                    self._update_tree_item_display(resolved_path)
+            else:
+                errors.append(f"Not in tree: {path}")
+        
+        result = f"Checked {checked_count} item(s)"
+        if errors:
+            result += f"\nCould not check: {', '.join(errors[:5])}"
+            if len(errors) > 5:
+                result += f" ... and {len(errors) - 5} more"
+        
+        return result
+    
+    def _uncheck_files(self, paths: list) -> str:
+        """Uncheck (deselect) files in the tree."""
+        if not paths:
+            return "No paths provided"
+        
+        unchecked_count = 0
+        
+        for path in paths:
+            resolved_path = self._resolve_path(path)
+            
+            if resolved_path in self.app.folder_tree_data:
+                if self.app.folder_tree_data[resolved_path]['checked']:
+                    self.app.folder_tree_data[resolved_path]['checked'] = False
+                    unchecked_count += 1
+                    self._update_tree_item_display(resolved_path)
+        
+        return f"Unchecked {unchecked_count} item(s)"
+    
+    def _check_directory(self, path: str) -> str:
+        """Recursively check all code files in a directory."""
+        resolved_path = self._resolve_path(path)
+        
+        if not os.path.exists(resolved_path):
+            return f"Path does not exist: {path}"
+        
+        checked_count = 0
+        
+        # Check all items in folder_tree_data that are under this path
+        for item_path, info in self.app.folder_tree_data.items():
+            if item_path.startswith(resolved_path):
+                if not info['is_dir'] and self._is_code_extension(item_path):
+                    if not info['checked']:
+                        info['checked'] = True
+                        checked_count += 1
+                        self._update_tree_item_display(item_path)
+        
+        return f"Recursively checked {checked_count} code file(s) in {path}"
+    
+    def _uncheck_directory(self, path: str) -> str:
+        """Recursively uncheck all files in a directory."""
+        resolved_path = self._resolve_path(path)
+        
+        unchecked_count = 0
+        
+        for item_path, info in self.app.folder_tree_data.items():
+            if item_path.startswith(resolved_path):
+                if info['checked']:
+                    info['checked'] = False
+                    unchecked_count += 1
+                    self._update_tree_item_display(item_path)
+        
+        return f"Recursively unchecked {unchecked_count} item(s) in {path}"
+    
+    def _get_current_selections(self) -> str:
+        """Get summary of current selections."""
+        checked_files = []
+        checked_dirs = []
+        
+        for path, info in self.app.folder_tree_data.items():
+            if info['checked']:
+                if info['is_dir']:
+                    checked_dirs.append(path)
+                else:
+                    checked_files.append(path)
+        
+        if not checked_files and not checked_dirs:
+            return "Nothing is currently selected."
+        
+        result = f"Currently selected: {len(checked_files)} files, {len(checked_dirs)} directories\n"
+        
+        # Group files by extension
+        ext_counts = {}
+        for f in checked_files:
+            _, ext = os.path.splitext(f)
+            ext = ext or "(no ext)"
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+        
+        if ext_counts:
+            result += f"By extension: {dict(ext_counts)}\n"
+        
+        # Show sample of selected files
+        if checked_files:
+            result += f"Sample files: {', '.join([os.path.basename(f) for f in checked_files[:10]])}"
+            if len(checked_files) > 10:
+                result += f" ... and {len(checked_files) - 10} more"
+        
+        return result
+    
+    def _finish_selection(self, summary: str) -> str:
+        """Finish the selection process."""
+        # Count what was selected
+        checked_files = sum(1 for info in self.app.folder_tree_data.values() 
+                          if info['checked'] and not info['is_dir'])
+        checked_dirs = sum(1 for info in self.app.folder_tree_data.values() 
+                         if info['checked'] and info['is_dir'])
+        
+        return f"SELECTION_COMPLETE: {summary}\nTotal: {checked_files} files, {checked_dirs} directories selected."
+    
+    def _update_tree_item_display(self, path: str):
+        """Update the display of a tree item after check/uncheck."""
+        if path in self.app.tree_ids_map:
+            tree_id = self.app.tree_ids_map[path]
+            info = self.app.folder_tree_data.get(path, {})
+            is_checked = info.get('checked', False)
+            is_dir = info.get('is_dir', False)
+            
+            name = os.path.basename(path)
+            prefix = "☑" if is_checked else "☐"
+            icon = "📁" if is_dir else "📄"
+            
+            try:
+                self.app.tree.item(tree_id, text=f"{prefix} {icon} {name}")
+            except:
+                pass  # Tree item might not exist
+    
+    def run(self, user_prompt: str):
+        """
+        Run the Smart Select agent with a user prompt.
+        
+        This is a generator that yields events as they occur:
+        - {"type": "text", "content": "..."} - Text from Claude
+        - {"type": "tool_call", "name": "...", "input": {...}} - Tool being called  
+        - {"type": "tool_result", "name": "...", "result": "..."} - Tool result
+        - {"type": "done", "summary": "..."} - Selection complete
+        - {"type": "error", "message": "..."} - Error occurred
+        
+        Yields:
+            dict: Event objects describing what's happening
+        """
+        # Build system prompt
+        system_prompt = SMART_SELECT_DEFAULT_PROMPT
+        if user_prompt:
+            system_prompt += f"\n{user_prompt}"
+        
+        # Add context about available folders
+        folder_context = "\n\nAvailable root folders:\n"
+        for root in self.app.root_folders:
+            folder_context += f"- {root}\n"
+        
+        # Initial user message
+        initial_message = folder_context + "\n\nPlease analyze the project structure and select all relevant code files."
+        
+        self.conversation_history = [{"role": "user", "content": initial_message}]
+        
+        max_iterations = 50
+        iteration = 0
+        
+        while iteration < max_iterations and not self.cancelled:
+            iteration += 1
+            
+            try:
+                # Call Claude with streaming
+                with self.client.messages.stream(
+                    model=self.model,
+                    max_tokens=4096,
+                    system=system_prompt,
+                    tools=SMART_SELECT_TOOLS,
+                    tool_choice={"type": "auto"},
+                    messages=self.conversation_history
+                ) as stream:
+                    
+                    for event in stream:
+                        if self.cancelled:
+                            yield {"type": "error", "message": "Cancelled by user"}
+                            return
+                        
+                        if event.type == "text":
+                            yield {"type": "text", "content": event.text}
+                    
+                    # Get the final message
+                    final_message = stream.get_final_message()
+                    
+                    # Check for tool use blocks
+                    tool_use_blocks = [
+                        block for block in final_message.content 
+                        if block.type == "tool_use"
+                    ]
+                    
+                    # Extract text
+                    text_blocks = [
+                        block.text for block in final_message.content 
+                        if block.type == "text"
+                    ]
+                    
+                    if tool_use_blocks:
+                        # Claude wants to use tools
+                        self.conversation_history.append({
+                            "role": "assistant",
+                            "content": final_message.content
+                        })
+                        
+                        # Execute each tool
+                        tool_results = []
+                        for tool_block in tool_use_blocks:
+                            tool_name = tool_block.name
+                            tool_input = tool_block.input
+                            
+                            yield {
+                                "type": "tool_call",
+                                "name": tool_name,
+                                "input": tool_input
+                            }
+                            
+                            # Execute the tool
+                            result = self.execute_tool(tool_name, tool_input)
+                            
+                            yield {
+                                "type": "tool_result",
+                                "name": tool_name,
+                                "result": result
+                            }
+                            
+                            # Check if this was finish_selection
+                            if tool_name == "finish_selection":
+                                yield {"type": "done", "summary": result}
+                                return
+                            
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_block.id,
+                                "content": result
+                            })
+                        
+                        # Add tool results to conversation
+                        self.conversation_history.append({
+                            "role": "user",
+                            "content": tool_results
+                        })
+                    else:
+                        # No tool calls - Claude is done talking
+                        self.conversation_history.append({
+                            "role": "assistant",
+                            "content": "".join(text_blocks)
+                        })
+                        
+                        # If Claude didn't call finish_selection, we're still done
+                        yield {"type": "done", "summary": "Selection process completed"}
+                        return
+                        
+            except Exception as e:
+                yield {"type": "error", "message": str(e)}
+                return
+        
+        if self.cancelled:
+            yield {"type": "error", "message": "Cancelled by user"}
+        else:
+            yield {"type": "error", "message": "Maximum iterations reached"}
+
+
+
 def read_file_with_fallback(path):
     """
     Try reading a file with UTF-8, then fallback to CP-1252,
@@ -382,32 +1020,342 @@ def read_file_with_fallback(path):
 
 def remove_comments_from_code(code, ext):
     """Remove comments from code based on file extension."""
+    # Compiled patterns with appropriate flags - single-line patterns without DOTALL,
+    # multiline patterns with DOTALL only where needed
     patterns = {
-        'py': [r'(?m)#.*$', r'""".*?"""', r"'''(?:.|\n)*?'''"],
-        'js': [r'(?m)//.*$', r'/\*.*?\*/'],
-        'ts': [r'(?m)//.*$', r'/\*.*?\*/'],
-        'java': [r'(?m)//.*$', r'/\*.*?\*/'],
-        'c': [r'(?m)//.*$', r'/\*.*?\*/'],
-        'cpp': [r'(?m)//.*$', r'/\*.*?\*/'],
-        'h': [r'(?m)//.*$', r'/\*.*?\*/'],
-        'cs': [r'(?m)//.*$', r'/\*.*?\*/'],
-        'go': [r'(?m)//.*$', r'/\*.*?\*/'],
-        'rb': [r'(?m)#.*$', r'=begin(?:.|\n)*?=end'],
-        'php': [r'(?m)//.*$', r'(?m)#.*$', r'/\*.*?\*/'],
-        'sh': [r'(?m)#.*$'],
-        'bash': [r'(?m)#.*$'],
-        'rs': [r'(?m)//.*$', r'/\*.*?\*/'],
-        'html': [r'<!--.*?-->'],
-        'xml': [r'<!--.*?-->'],
+        'py': [
+            re.compile(r'#[^\r\n]*'),                    # Single-line comments
+            re.compile(r'""".*?"""', re.DOTALL),         # Triple-quoted strings
+            re.compile(r"'''.*?'''", re.DOTALL),         # Triple-quoted strings (single quotes)
+        ],
+        'js': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'ts': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'java': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'c': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'cpp': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'h': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'cs': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'go': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'rb': [
+            re.compile(r'#[^\r\n]*'),                    # Single-line comments
+            re.compile(r'=begin.*?=end', re.DOTALL),     # Multi-line comments
+        ],
+        'php': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments (//)
+            re.compile(r'#[^\r\n]*'),                    # Single-line comments (#)
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'sh': [
+            re.compile(r'#[^\r\n]*'),                    # Single-line comments
+        ],
+        'bash': [
+            re.compile(r'#[^\r\n]*'),                    # Single-line comments
+        ],
+        'rs': [
+            re.compile(r'//[^\r\n]*'),                   # Single-line comments
+            re.compile(r'/\*.*?\*/', re.DOTALL),         # Multi-line comments
+        ],
+        'html': [
+            re.compile(r'<!--.*?-->', re.DOTALL),        # HTML comments can span lines
+        ],
+        'xml': [
+            re.compile(r'<!--.*?-->', re.DOTALL),        # XML comments can span lines
+        ],
     }
 
     if ext not in patterns:
         return code
 
+    # Count braces before processing to detect structural damage
+    original_brace_count = {
+        '{': code.count('{'),
+        '}': code.count('}'),
+        '(': code.count('('),
+        ')': code.count(')'),
+        '[': code.count('['),
+        ']': code.count(']'),
+    }
+
     new_code = code
-    for pat in patterns[ext]:
-        new_code = re.sub(pat, '', new_code, flags=re.DOTALL)
+    for regex in patterns[ext]:
+        new_code = regex.sub('', new_code)
+    
+    # Safety check: ensure we haven't broken brace balance
+    new_brace_count = {
+        '{': new_code.count('{'),
+        '}': new_code.count('}'),
+        '(': new_code.count('('),
+        ')': new_code.count(')'),
+        '[': new_code.count('['),
+        ']': new_code.count(']'),
+    }
+    
+    # Check if brace counts have changed dramatically (more than expected from comment removal)
+    for brace_type in ['{', '}', '(', ')', '[', ']']:
+        if abs(original_brace_count[brace_type] - new_brace_count[brace_type]) > 0:
+            # If any brace count changed, it might indicate we removed code, not just comments
+            # For safety, check if we've lost more than a few braces
+            if (original_brace_count['{'] - new_brace_count['{']) > 2 or \
+               (original_brace_count['}'] - new_brace_count['}']) > 2:
+                print(f"Warning: Comment removal changed brace structure significantly. "
+                      f"Original: {original_brace_count}, New: {new_brace_count}")
+                # Return original code if structural integrity appears compromised
+                return code
+    
     return new_code
+
+
+class SmartSelectDialog:
+    """
+    Dialog for the Smart Select AI feature.
+    Shows a customizable prompt, progress log, and controls.
+    """
+    
+    def __init__(self, parent, folder_monitor_app):
+        self.parent = parent
+        self.app = folder_monitor_app
+        self.agent = None
+        self.running = False
+        self.cancelled = False
+        
+        # Create the dialog window
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("🪄 Smart Select - AI File Selection")
+        self.dialog.geometry("700x600")
+        self.dialog.resizable(True, True)
+        
+        # Center the dialog on parent
+        self.dialog.transient(parent)
+        
+        # Create the UI
+        self.setup_ui()
+        
+        # Handle window close
+        self.dialog.protocol("WM_DELETE_WINDOW", self.on_close)
+    
+    def setup_ui(self):
+        """Set up the Smart Select dialog UI."""
+        main_frame = tk.Frame(self.dialog, padx=10, pady=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # API Key section
+        api_frame = tk.LabelFrame(main_frame, text="Anthropic API Key", padx=5, pady=5)
+        api_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.api_key_var = tk.StringVar(value=getattr(self.app, 'anthropic_api_key', ''))
+        self.show_key_var = tk.BooleanVar(value=False)
+        
+        key_entry_frame = tk.Frame(api_frame)
+        key_entry_frame.pack(fill=tk.X)
+        
+        self.api_key_entry = tk.Entry(key_entry_frame, textvariable=self.api_key_var, 
+                                      show="*", width=60)
+        self.api_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        def toggle_show_key():
+            self.api_key_entry.config(show="" if self.show_key_var.get() else "*")
+        
+        show_key_check = tk.Checkbutton(key_entry_frame, text="Show", 
+                                        variable=self.show_key_var, command=toggle_show_key)
+        show_key_check.pack(side=tk.LEFT, padx=(5, 0))
+        
+        # Prompt section
+        prompt_frame = tk.LabelFrame(main_frame, text="AI Instructions (customize or leave default)", 
+                                    padx=5, pady=5)
+        prompt_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # Default prompt hint
+        hint_label = tk.Label(prompt_frame, 
+                             text="Add specific instructions below. The AI will select code files and ignore dependencies/media by default.",
+                             fg="gray", font=("Arial", 9), anchor="w")
+        hint_label.pack(fill=tk.X)
+        
+        self.prompt_text = ScrolledText(prompt_frame, height=6, wrap=tk.WORD)
+        self.prompt_text.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        self.prompt_text.insert("1.0", "Select all the relevant source code files for this project.")
+        
+        # Progress log section
+        log_frame = tk.LabelFrame(main_frame, text="Progress", padx=5, pady=5)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        self.log_text = ScrolledText(log_frame, height=12, wrap=tk.WORD, state=tk.DISABLED)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Buttons
+        button_frame = tk.Frame(main_frame)
+        button_frame.pack(fill=tk.X)
+        
+        self.start_button = tk.Button(button_frame, text="🚀 Start Smart Select", 
+                                      command=self.on_start, bg="#4CAF50", fg="white",
+                                      font=("Arial", 11, "bold"))
+        self.start_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.cancel_button = tk.Button(button_frame, text="Cancel", 
+                                       command=self.on_cancel, state=tk.DISABLED)
+        self.cancel_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.close_button = tk.Button(button_frame, text="Close", command=self.on_close)
+        self.close_button.pack(side=tk.RIGHT)
+        
+        # Status label
+        self.status_label = tk.Label(button_frame, text="Ready", fg="gray")
+        self.status_label.pack(side=tk.LEFT, padx=(20, 0))
+    
+    def log(self, message: str, tag: str = None):
+        """Add a message to the log."""
+        self.log_text.config(state=tk.NORMAL)
+        if tag:
+            self.log_text.insert(tk.END, f"[{tag}] {message}\n")
+        else:
+            self.log_text.insert(tk.END, f"{message}\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
+        self.dialog.update()
+    
+    def on_start(self):
+        """Start the Smart Select process."""
+        api_key = self.api_key_var.get().strip()
+        
+        if not api_key:
+            messagebox.showerror("API Key Required", 
+                               "Please enter your Anthropic API key to use Smart Select.")
+            return
+        
+        if not self.app.root_folders:
+            messagebox.showerror("No Folders", 
+                               "Please add at least one folder before using Smart Select.")
+            return
+        
+        if not ANTHROPIC_AVAILABLE:
+            messagebox.showerror("Package Not Installed", 
+                               "The 'anthropic' package is not installed.\n\n"
+                               "Run: pip install anthropic>=0.40.0")
+            return
+        
+        # Save the API key
+        self.app.anthropic_api_key = api_key
+        self.app.save_settings()
+        
+        # Get user prompt
+        user_prompt = self.prompt_text.get("1.0", tk.END).strip()
+        
+        # Update UI state
+        self.running = True
+        self.cancelled = False
+        self.start_button.config(state=tk.DISABLED)
+        self.cancel_button.config(state=tk.NORMAL)
+        self.status_label.config(text="Running...", fg="blue")
+        
+        # Clear log
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.config(state=tk.DISABLED)
+        
+        self.log("Starting Smart Select with Claude Opus 4.5...", "INFO")
+        self.log(f"Root folders: {len(self.app.root_folders)}", "INFO")
+        
+        # Run in a thread to keep UI responsive
+        def run_agent():
+            try:
+                self.agent = SmartSelectAgent(api_key, self.app)
+                
+                for event in self.agent.run(user_prompt):
+                    if self.cancelled:
+                        break
+                    
+                    if event["type"] == "text":
+                        # Stream text to log
+                        self.dialog.after(0, lambda e=event: self.log(e["content"], "AI"))
+                    
+                    elif event["type"] == "tool_call":
+                        tool_name = event["name"]
+                        tool_input = event.get("input", {})
+                        input_str = str(tool_input)
+                        if len(input_str) > 100:
+                            input_str = input_str[:100] + "..."
+                        self.dialog.after(0, lambda tn=tool_name, ti=input_str: 
+                                         self.log(f"🔧 {tn}({ti})", "TOOL"))
+                    
+                    elif event["type"] == "tool_result":
+                        result = event["result"]
+                        if len(result) > 200:
+                            result = result[:200] + "..."
+                        self.dialog.after(0, lambda r=result: self.log(f"   → {r}", "RESULT"))
+                    
+                    elif event["type"] == "done":
+                        self.dialog.after(0, lambda e=event: self._on_complete(e))
+                    
+                    elif event["type"] == "error":
+                        self.dialog.after(0, lambda e=event: self._on_error(e))
+                
+            except Exception as e:
+                self.dialog.after(0, lambda err=str(e): self._on_error({"message": err}))
+        
+        thread = threading.Thread(target=run_agent, daemon=True)
+        thread.start()
+    
+    def _on_complete(self, event):
+        """Handle completion."""
+        self.running = False
+        self.start_button.config(state=tk.NORMAL)
+        self.cancel_button.config(state=tk.DISABLED)
+        self.status_label.config(text="Complete!", fg="green")
+        self.log(f"\n✅ {event.get('summary', 'Selection complete!')}", "DONE")
+        
+        # Update the button count
+        if hasattr(self.app, 'update_show_selected_button'):
+            self.app.update_show_selected_button()
+    
+    def _on_error(self, event):
+        """Handle error."""
+        self.running = False
+        self.start_button.config(state=tk.NORMAL)
+        self.cancel_button.config(state=tk.DISABLED)
+        self.status_label.config(text="Error", fg="red")
+        self.log(f"\n❌ Error: {event.get('message', 'Unknown error')}", "ERROR")
+    
+    def on_cancel(self):
+        """Cancel the running process."""
+        if self.agent:
+            self.agent.cancel()
+        self.cancelled = True
+        self.status_label.config(text="Cancelling...", fg="orange")
+        self.log("Cancelling...", "INFO")
+    
+    def on_close(self):
+        """Close the dialog."""
+        if self.running:
+            if not messagebox.askyesno("Confirm Close", 
+                                       "Smart Select is still running. Close anyway?"):
+                return
+            self.on_cancel()
+        
+        self.dialog.destroy()
+
 
 class FolderMonitorApp:
     def __init__(self, master):
@@ -460,6 +1408,9 @@ class FolderMonitorApp:
         # Meta prompts
         self.meta_prompts = []
         self.user_instructions = ""
+        
+        # Anthropic API key for Smart Select (Claude Opus 4.5)
+        self.anthropic_api_key = ""
 
         # Default ignore patterns for common system folders
         self.default_ignore_patterns = [
@@ -685,6 +1636,13 @@ class FolderMonitorApp:
 
         btn_reduce_tokens = tk.Button(refresh_frame, text="Reduce Tokens", command=self.on_reduce_tokens, bg="#4CAF50", fg="white")
         btn_reduce_tokens.pack(side=tk.LEFT, padx=5)
+
+        # Smart Select AI button
+        btn_smart_select = tk.Button(refresh_frame, text="🪄 Smart Select", 
+                                    command=self.on_smart_select, 
+                                    bg="#9C27B0", fg="white",
+                                    font=("Arial", 9, "bold"))
+        btn_smart_select.pack(side=tk.LEFT, padx=5)
 
         # System Folder Filter Checkbox
         chk_system_filter = tk.Checkbutton(
@@ -2632,6 +3590,7 @@ class FolderMonitorApp:
                         "strip_comments": self.strip_comments_var.get(),
                         "selection_presets": getattr(self, 'selection_presets', {}),
                         "token_model": self.token_model.get(),
+                        "anthropic_api_key": getattr(self, 'anthropic_api_key', ''),
                     }
                     for path, info in self.folder_tree_data.items():
                         data["folder_checks"][path] = info['checked']
@@ -2698,6 +3657,7 @@ class FolderMonitorApp:
                 self.strip_comments_var.set(data.get("strip_comments", False))
                 self.selection_presets = data.get("selection_presets", {})
                 self.token_model.set(data.get("token_model", DEFAULT_MODEL))
+                self.anthropic_api_key = data.get("anthropic_api_key", "")
             except Exception as e:
                 messagebox.showerror("Error Loading Settings", str(e))
         
@@ -3479,7 +4439,7 @@ class FolderMonitorApp:
 
     def on_new_profile(self):
         """Create a new profile."""
-        def save_new_profile():
+        def proceed_to_folder_selection():
             name = entry_name.get().strip()
             if not name:
                 error_label.config(text="Profile name cannot be empty")
@@ -3491,39 +4451,59 @@ class FolderMonitorApp:
                 error_label.config(text="Profile already exists")
                 return
             
-            self.current_profile = name
-            self.profile_var.set(name)
-            self.profiles.append(name)
-            self.profile_combo['values'] = self.profiles
-            
-            # Save as last used profile
-            self.save_last_profile(name)
-            
-            # Clear the file list and user instructions for the new profile
-            self.root_folders = []
-            self.user_instructions = ""
-            
-            # Clear the folder tree data and tree view
-            self.folder_tree_data.clear()
-            self.tree_ids_map.clear()
-            self.visited_dirs.clear()
-            self.tree.delete(*self.tree.get_children())
-            
-            self.save_settings()
+            # Close the name dialog
             new_win.destroy()
-            self.set_status(f"Created new profile: {name}")
+            
+            # Ask for folder selection
+            folder = filedialog.askdirectory(title=f"Select Folder for Profile '{name}'")
+            if folder:
+                # Create the new profile
+                self.current_profile = name
+                self.profile_var.set(name)
+                self.profiles.append(name)
+                self.profile_combo['values'] = self.profiles
+                
+                # Save as last used profile
+                self.save_last_profile(name)
+                
+                # Clear the file list but keep user instructions
+                self.root_folders = [folder]
+                # Note: we're keeping self.user_instructions unchanged
+                
+                # Clear the folder tree data and tree view
+                self.folder_tree_data.clear()
+                self.tree_ids_map.clear()
+                self.visited_dirs.clear()
+                self.tree.delete(*self.tree.get_children())
+                
+                # Build tree for the new folder
+                self.build_tree_for(folder)
+                
+                self.save_settings()
+                self.set_status(f"Created new profile: {name}")
+            # If user cancels folder selection, nothing happens
         
         new_win = tk.Toplevel(self.master)
-        new_win.title("New Profile")
+        new_win.title("New Profile - Step 1")
+        new_win.geometry("300x150")
+        new_win.resizable(False, False)
         
         tk.Label(new_win, text="Profile Name:").pack(padx=5, pady=5)
-        entry_name = tk.Entry(new_win)
+        entry_name = tk.Entry(new_win, width=30)
         entry_name.pack(padx=5, pady=5)
+        entry_name.focus()
         
         error_label = tk.Label(new_win, text="", fg="red")
         error_label.pack(padx=5, pady=2)
         
-        tk.Button(new_win, text="Create", command=save_new_profile).pack(padx=5, pady=5)
+        button_frame = tk.Frame(new_win)
+        button_frame.pack(pady=10)
+        
+        tk.Button(button_frame, text="Cancel", command=new_win.destroy, width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(button_frame, text="Next", command=proceed_to_folder_selection, width=10).pack(side=tk.LEFT, padx=5)
+        
+        # Allow Enter key to proceed
+        entry_name.bind('<Return>', lambda e: proceed_to_folder_selection())
 
     def on_update_profile(self):
         """Update current profile."""
@@ -3678,6 +4658,7 @@ class FolderMonitorApp:
             "strip_comments": self.strip_comments_var.get(),
             "selection_presets": getattr(self, 'selection_presets', {}),
             "token_model": self.token_model.get(),
+            "anthropic_api_key": getattr(self, 'anthropic_api_key', ''),
         }
         for path, info in self.folder_tree_data.items():
             data["folder_checks"][path] = info['checked']
@@ -3859,6 +4840,23 @@ class FolderMonitorApp:
     def on_reduce_tokens(self):
         """Open the token reduction helper dialog."""
         self.open_token_reduction_dialog()
+
+    def on_smart_select(self):
+        """Open the AI-powered Smart Select dialog."""
+        if not ANTHROPIC_AVAILABLE:
+            messagebox.showerror("Package Not Installed", 
+                               "The 'anthropic' package is not installed.\n\n"
+                               "Run: pip install anthropic>=0.40.0\n\n"
+                               "Then restart the application.")
+            return
+        
+        if not self.root_folders:
+            messagebox.showwarning("No Folders", 
+                                 "Please add at least one folder before using Smart Select.")
+            return
+        
+        # Open the Smart Select dialog
+        SmartSelectDialog(self.master, self)
 
     def open_token_reduction_dialog(self):
         """Create and show the token reduction helper dialog."""
