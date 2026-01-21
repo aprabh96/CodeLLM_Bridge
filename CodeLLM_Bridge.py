@@ -603,7 +603,7 @@ SMART_SELECT_TOOLS = [
 
 class SmartSelectAgent:
     """
-    AI Agent for Smart File Selection using Claude Opus 4.5.
+    AI Agent for Smart File Selection using Claude Haiku 4.5.
     
     Implements an agentic loop that:
     1. Takes a user prompt about what to select
@@ -611,14 +611,14 @@ class SmartSelectAgent:
     3. Continues until finish_selection is called
     """
     
-    def __init__(self, api_key: str, folder_monitor_app, model: str = "claude-opus-4-5-20251101"):
+    def __init__(self, api_key: str, folder_monitor_app, model: str = "claude-haiku-4-5-20251001"):
         """
         Initialize the Smart Select agent.
         
         Args:
             api_key: Anthropic API key
             folder_monitor_app: Reference to the FolderMonitorApp instance
-            model: Claude model to use (default: Claude Opus 4.5)
+            model: Claude model to use (default: Claude Haiku 4.5)
         """
         if not ANTHROPIC_AVAILABLE:
             raise RuntimeError("Anthropic package not installed. Run: pip install anthropic>=0.40.0")
@@ -990,19 +990,23 @@ class SmartSelectAgent:
         return f"SELECTION_COMPLETE: {summary}\nTotal: {checked_files} files, {checked_dirs} directories selected."
     
     def _update_tree_item_display(self, path: str):
-        """Update the display of a tree item after check/uncheck."""
+        """Update the display of a tree item after check/uncheck.
+        Uses the same format as set_subtree_checked for consistency.
+        """
         if path in self.app.tree_ids_map:
             tree_id = self.app.tree_ids_map[path]
             info = self.app.folder_tree_data.get(path, {})
             is_checked = info.get('checked', False)
-            is_dir = info.get('is_dir', False)
-            
-            name = os.path.basename(path)
-            prefix = "☑" if is_checked else "☐"
-            icon = "📁" if is_dir else "📄"
             
             try:
-                self.app.tree.item(tree_id, text=f"{prefix} {icon} {name}")
+                # Get current text and strip any existing [x] prefix
+                text = self.app.tree.item(tree_id, 'text')
+                text_without_check = text.replace("[x] ", "", 1) if text.startswith("[x] ") else text
+                
+                if is_checked:
+                    self.app.tree.item(tree_id, text=f"[x] {text_without_check}")
+                else:
+                    self.app.tree.item(tree_id, text=text_without_check)
             except:
                 pass  # Tree item might not exist
     
@@ -1136,10 +1140,17 @@ class SmartSelectAgent:
                                 yield {"type": "done", "summary": result}
                                 return
                             
+                            # Truncate result for history to save tokens
+                            # The AI has already seen the full result, so we can abbreviate
+                            history_result = result
+                            if len(result) > 1000:
+                                # Keep first 800 chars + note about truncation
+                                history_result = result[:800] + f"\n... [truncated, {len(result)} chars total]"
+                            
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_block.id,
-                                "content": result
+                                "content": history_result
                             })
                         
                         # Add tool results to conversation
@@ -1464,7 +1475,7 @@ class SmartSelectDialog:
         self.total_cache_created = 0
         self.usage_label.config(text="💰 Tokens: -- input | -- output | Cache: --")
         
-        self.log("Starting Smart Select with Claude Opus 4.5...", "INFO")
+        self.log("Starting Smart Select with Claude Haiku 4.5...", "INFO")
         self.log(f"Root folders: {len(self.app.root_folders)}", "INFO")
         self.log("Prompt caching enabled - subsequent iterations cost 90% less!", "INFO")
         
@@ -1539,11 +1550,11 @@ class SmartSelectDialog:
         self.total_cache_read += event.get("cache_read_tokens", 0)
         self.total_cache_created += event.get("cache_creation_tokens", 0)
         
-        # Calculate estimated cost (Claude Opus 4.5 pricing: $15/M input, $75/M output)
+        # Calculate estimated cost (Claude Haiku 4.5 pricing: $1/M input, $5/M output)
         # Cache reads are 90% cheaper
-        input_cost = (self.total_input_tokens - self.total_cache_read) * 15 / 1_000_000
-        cache_cost = self.total_cache_read * 1.5 / 1_000_000  # 90% discount
-        output_cost = self.total_output_tokens * 75 / 1_000_000
+        input_cost = (self.total_input_tokens - self.total_cache_read) * 1 / 1_000_000
+        cache_cost = self.total_cache_read * 0.1 / 1_000_000  # 90% discount
+        output_cost = self.total_output_tokens * 5 / 1_000_000
         total_cost = input_cost + cache_cost + output_cost
         
         # Format display
@@ -1628,7 +1639,7 @@ class FolderMonitorApp:
         self.meta_prompts = []
         self.user_instructions = ""
         
-        # Anthropic API key for Smart Select (Claude Opus 4.5)
+        # Anthropic API key for Smart Select (Claude Haiku 4.5)
         # This is a GLOBAL setting, not per-profile
         self.anthropic_api_key = self._load_global_anthropic_api_key()
 
