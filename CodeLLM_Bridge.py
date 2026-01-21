@@ -1140,17 +1140,10 @@ class SmartSelectAgent:
                                 yield {"type": "done", "summary": result}
                                 return
                             
-                            # Truncate result for history to save tokens
-                            # The AI has already seen the full result, so we can abbreviate
-                            history_result = result
-                            if len(result) > 1000:
-                                # Keep first 800 chars + note about truncation
-                                history_result = result[:800] + f"\n... [truncated, {len(result)} chars total]"
-                            
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_block.id,
-                                "content": history_result
+                                "content": result
                             })
                         
                         # Add tool results to conversation
