@@ -448,13 +448,30 @@ total size manageable (AI chats have context limits).
 - README, documentation if helpful
 - Test files (only if user asks or they're essential)
 
-## What to EXCLUDE (these waste tokens and add noise):
-1. **Dependency folders**: node_modules, venv, __pycache__, vendor, packages, site-packages
-2. **Build outputs**: dist, build, out, .next, .nuxt, bin, obj, target
-3. **Non-code files**: Images, videos, audio, archives, executables, fonts
-4. **IDE folders**: .idea, .vscode, .vs, .eclipse
-5. **Cache/temp files**: .cache, .tmp, logs
-6. **Lock files**: package-lock.json, yarn.lock, Gemfile.lock (usually too large)
+## What to EXCLUDE (use your intelligence to recognize these):
+
+**CRITICAL: Use your judgment to identify and skip ANY code that is NOT written by the project developers:**
+
+1. **Dependencies & Third-Party Code** - ANY folder OR FILE that contains external/downloaded code:
+   - Common folder names: node_modules, venv, vendor, packages, site-packages, libs, lib, external
+   - But also recognize: third_party, deps, dependencies, sdk, SDK, extern, thirdparty
+   - **Dependency FILES**: minified bundles (.min.js), vendored copies, auto-generated code
+   - Look for clues: folders with hundreds of subfolders, version numbers in names, different coding style
+   - If unsure, use `read_file_preview` - dependency files often have copyright headers, "generated" comments, or minified code
+
+2. **SDKs and Frameworks** - Pre-built code the user didn't write:
+   - Unity packages, Unreal plugins, game engine assets
+   - Platform SDKs (Android, iOS, Windows SDK files)
+   - Framework templates/boilerplate
+
+3. **Build Outputs** - Generated files, not source:
+   - dist, build, out, .next, .nuxt, bin, obj, target, __pycache__
+
+4. **Non-Code Files** - Images, videos, audio, archives, executables, fonts
+
+5. **IDE/Cache** - .idea, .vscode, .vs, .cache, .tmp, logs
+
+6. **Lock Files** - package-lock.json, yarn.lock, Gemfile.lock (too large, no value)
 
 ## How to Work
 1. START by calling `list_directory` on the root folder(s) to see the project structure
@@ -987,28 +1004,51 @@ class SmartSelectAgent:
         checked_dirs = sum(1 for info in self.app.folder_tree_data.values() 
                          if info['checked'] and info['is_dir'])
         
+        # Schedule UI updates on main thread
+        def update_ui():
+            try:
+                if hasattr(self.app, 'update_show_selected_button'):
+                    self.app.update_show_selected_button()
+                self.app.save_settings()
+            except:
+                pass
+        
+        try:
+            self.app.master.after(0, update_ui)
+        except:
+            update_ui()
+        
         return f"SELECTION_COMPLETE: {summary}\nTotal: {checked_files} files, {checked_dirs} directories selected."
     
     def _update_tree_item_display(self, path: str):
         """Update the display of a tree item after check/uncheck.
         Uses the same format as set_subtree_checked for consistency.
+        Thread-safe: schedules the update on the main thread.
         """
-        if path in self.app.tree_ids_map:
-            tree_id = self.app.tree_ids_map[path]
-            info = self.app.folder_tree_data.get(path, {})
-            is_checked = info.get('checked', False)
-            
-            try:
-                # Get current text and strip any existing [x] prefix
-                text = self.app.tree.item(tree_id, 'text')
-                text_without_check = text.replace("[x] ", "", 1) if text.startswith("[x] ") else text
+        def do_update():
+            if path in self.app.tree_ids_map:
+                tree_id = self.app.tree_ids_map[path]
+                info = self.app.folder_tree_data.get(path, {})
+                is_checked = info.get('checked', False)
                 
-                if is_checked:
-                    self.app.tree.item(tree_id, text=f"[x] {text_without_check}")
-                else:
-                    self.app.tree.item(tree_id, text=text_without_check)
-            except:
-                pass  # Tree item might not exist
+                try:
+                    # Get current text and strip any existing [x] prefix
+                    text = self.app.tree.item(tree_id, 'text')
+                    text_without_check = text.replace("[x] ", "", 1) if text.startswith("[x] ") else text
+                    
+                    if is_checked:
+                        self.app.tree.item(tree_id, text=f"[x] {text_without_check}")
+                    else:
+                        self.app.tree.item(tree_id, text=text_without_check)
+                except:
+                    pass  # Tree item might not exist
+        
+        # Schedule on main thread for thread safety
+        try:
+            self.app.master.after(0, do_update)
+        except:
+            # If master is not available, try direct call (might be on main thread already)
+            do_update()
     
     def run(self, user_prompt: str):
         """
@@ -1867,6 +1907,12 @@ class FolderMonitorApp:
                                     bg="#9C27B0", fg="white",
                                     font=("Arial", 9, "bold"))
         btn_smart_select.pack(side=tk.LEFT, padx=5)
+
+        # Unselect All button
+        btn_unselect_all = tk.Button(refresh_frame, text="☐ Unselect All", 
+                                    command=self.on_unselect_all,
+                                    bg="#757575", fg="white")
+        btn_unselect_all.pack(side=tk.LEFT, padx=5)
 
         # System Folder Filter Checkbox
         chk_system_filter = tk.Checkbutton(
@@ -5114,6 +5160,29 @@ class FolderMonitorApp:
         
         # Open the Smart Select dialog
         SmartSelectDialog(self.master, self)
+
+    def on_unselect_all(self):
+        """Unselect all files and folders in the tree."""
+        count = 0
+        for path, info in self.folder_tree_data.items():
+            if info['checked']:
+                info['checked'] = False
+                count += 1
+                
+                # Update tree display
+                if path in self.tree_ids_map:
+                    tree_id = self.tree_ids_map[path]
+                    try:
+                        text = self.tree.item(tree_id, 'text')
+                        text_without_check = text.replace("[x] ", "", 1) if text.startswith("[x] ") else text
+                        self.tree.item(tree_id, text=text_without_check)
+                    except:
+                        pass
+        
+        # Update UI
+        self.update_show_selected_button()
+        self.save_settings()
+        self.set_status(f"☐ Unselected {count} items")
 
     def open_token_reduction_dialog(self):
         """Create and show the token reduction helper dialog."""
